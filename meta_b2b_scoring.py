@@ -5,24 +5,40 @@ Uses Grok AI for scoring - GitHub Actions + BigQuery (Free Tier)
 """
 
 import os
-import json
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from google.cloud import bigquery
 
 # Configuration (set in GitHub Secrets)
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "meta_ads_b2b")
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN") #EAAeSe2JFU8MBRewPP3TfQ4TOtZBZA1P0dW6fosVr2dpD3uuBoyavfIfQxdBw90zaWfTShwBjJbK1gDLFhcqzFdH3ptPsIvCFX6KF0VJ2qRzQ8EZAzEZBZBZBNE8hNs6sIK1L9bUKeL7BFtSbnFZBt0wdkZBb1VRa0qYDHNQpvgcZC17vUojmAHnoxmjxNcG7XmSKcufPg45ev
-META_AD_ACCOUNT_ID = os.getenv("META_AD_ACCOUNT_ID") # META_AD_ACCOUNT_ID = 1330926404386944
+META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
+META_AD_ACCOUNT_ID = os.getenv("META_AD_ACCOUNT_ID")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROK_URL = "https://api.x.ai/v1/chat/completions"
 
-# BigQuery client
-bq = bigquery.Client(project=GCP_PROJECT_ID)
+# Validate required env vars
+if not GCP_PROJECT_ID:
+    raise ValueError("GCP_PROJECT_ID environment variable is required")
+if not META_ACCESS_TOKEN:
+    raise ValueError("META_ACCESS_TOKEN environment variable is required")
+if not META_AD_ACCOUNT_ID:
+    raise ValueError("META_AD_ACCOUNT_ID environment variable is required")
+if not GROK_API_KEY:
+    raise ValueError("GROK_API_KEY environment variable is required")
+
+# BigQuery client (initialized lazily to avoid credential errors)
+bq = None
+
+def get_bigquery_client():
+    global bq
+    if bq is None:
+        bq = bigquery.Client(project=GCP_PROJECT_ID)
+    return bq
 
 def setup_bigquery():
     """Create BigQuery dataset and table if not exists."""
+    get_bigquery_client()
     dataset_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}"
     try:
         bq.get_dataset(dataset_id)
@@ -111,6 +127,7 @@ def grade_from_score(score):
 
 def load_to_bigquery(meta_data, table_id):
     """Load campaign data to BigQuery with Grok scores."""
+    get_bigquery_client()
     rows = []
     for campaign in meta_data.get("data", []):
         insights = campaign.get("insights", {}).get("data", [{}])[0]
