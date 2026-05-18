@@ -68,21 +68,19 @@ def setup_bigquery():
     return table_id
 
 def fetch_meta_ads():
-    """Extract all campaigns with pagination and lifetime insights."""
+    """Fetch all campaigns with pagination and lifetime insights."""
     all_campaigns = []
     url = f"https://graph.facebook.com/v19.0/{META_AD_ACCOUNT_ID}/campaigns"
     params = {
         "access_token": META_ACCESS_TOKEN,
         "fields": "id,name,status,insights.metric(leads,spend,impressions,clicks,ctr,cpm,cpp).period(lifetime)",
-        "limit": 100,
-        "filtering": '[{"field":"status","operator":"IN","value":["ACTIVE","PAUSED"]}]'
+        "limit": 100
     }
 
     while url:
         response = requests.get(url, params=params)
         data = response.json()
 
-        # Debug: print any API error
         if "error" in data:
             print(f"Meta API error: {data['error']}")
             return {"data": []}
@@ -90,17 +88,15 @@ def fetch_meta_ads():
         campaigns = data.get("data", [])
         all_campaigns.extend(campaigns)
 
-        # Get next page URL from paging
+        # Get next page URL
         url = data.get("paging", {}).get("next")
-        # For subsequent requests, params are already in the 'next' URL
         if url:
-            params = None   # next URL already contains all params
+            params = None  # next URL already contains all params
 
     return {"data": all_campaigns}
 
 def get_grok_score(campaign_data):
-    """Get AI-powered score from Grok."""
-    # Guard against missing keys
+    """Get AI-powered score from Grok (0-100)."""
     name = campaign_data.get('name', 'Unknown')
     leads = campaign_data.get('leads', 0)
     spend = campaign_data.get('spend', 0.0)
@@ -110,19 +106,19 @@ def get_grok_score(campaign_data):
     cpl = campaign_data.get('cost_per_lead', 0.0)
 
     prompt = f"""Score this Meta Ads B2B lead campaign 0-100:
-    Campaign: {name}
-    Leads: {leads}
-    Spend: ${spend:.2f}
-    Impressions: {impressions}
-    Clicks: {clicks}
-    CTR: {ctr:.2%}
-    CPL: ${cpl:.2f}
+Campaign: {name}
+Leads: {leads}
+Spend: ${spend:.2f}
+Impressions: {impressions}
+Clicks: {clicks}
+CTR: {ctr:.2%}
+CPL: ${cpl:.2f}
 
-    B2B scoring criteria:
-    - High lead count + low CPL = high score
-    - Good CTR indicates relevance
-    - Return only integer 0-100.
-    """
+B2B scoring criteria:
+- High lead count + low CPL = high score
+- Good CTR indicates relevance
+- Return only integer 0-100.
+"""
 
     try:
         response = requests.post(
@@ -142,7 +138,7 @@ def get_grok_score(campaign_data):
         return int(response.json()["choices"][0]["message"]["content"].strip())
     except Exception as e:
         print(f"Grok error: {e}")
-        return 50  # Default score
+        return 50
 
 def grade_from_score(score):
     if score >= 85: return "A"
@@ -152,16 +148,16 @@ def grade_from_score(score):
     return "F"
 
 def load_to_bigquery(meta_data, table_id):
-    """Load campaign data to BigQuery with Grok scores."""
+    """Score campaigns and load to BigQuery."""
     get_bigquery_client()
     rows = []
 
     for campaign in meta_data.get("data", []):
         insights = campaign.get("insights", {}).get("data", [{}])[0]
 
-        cpl = 0.0
         leads = insights.get("leads", 0)
         spend = insights.get("spend", 0.0)
+        cpl = 0.0
         if leads > 0:
             cpl = spend / leads
 
@@ -194,7 +190,6 @@ def load_to_bigquery(meta_data, table_id):
         rows.append(row)
         print(f"Processed: {campaign.get('name')} -> Score: {score}")
 
-    # ✅ Guard against empty rows
     if not rows:
         print("No campaigns to load. Skipping BigQuery insert.")
         return 0
