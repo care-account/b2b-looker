@@ -196,20 +196,55 @@ def get_grok_score(campaign_data):
     ctr = campaign_data.get('ctr', 0.0)
     cpl = campaign_data.get('cost_per_lead', 0.0)
 
-    # Strict prompt: no explanation, no fractions, just a plain integer
-    prompt = (
-        f"You are a B2B ad campaign scorer. "
-        f"Reply with a SINGLE integer between 0 and 100. No text, no explanation, no fraction. "
-        f"Score based on: high leads + low cost-per-lead = high score; zero leads = low score.\n\n"
-        f"Campaign: {name}\n"
-        f"Leads: {leads}\n"
-        f"Spend: ${spend:.2f}\n"
-        f"Impressions: {impressions}\n"
-        f"Clicks: {clicks}\n"
-        f"CTR: {ctr:.2f}%\n"
-        f"CPL: ${cpl:.2f}\n\n"
-        f"Score (integer 0-100):"
+    # Pre-compute derived metrics to give the model richer context
+    cpl_rating = (
+        "excellent (well below benchmark)"  if 0 < cpl <= 40  else
+        "good (below benchmark)"            if cpl <= 80      else
+        "average (at benchmark)"            if cpl <= 150     else
+        "poor (above benchmark)"            if cpl <= 300     else
+        "very poor (far above benchmark)"   if cpl >  300     else
+        "N/A (no leads)"
     )
+    ctr_rating = (
+        "excellent" if ctr >= 3.0 else
+        "good"      if ctr >= 1.5 else
+        "average"   if ctr >= 0.8 else
+        "poor"
+    )
+    lead_volume_rating = (
+        "very high" if leads >= 5000 else
+        "high"      if leads >= 1000 else
+        "moderate"  if leads >= 200  else
+        "low"       if leads >= 50   else
+        "very low"  if leads >  0    else
+        "zero"
+    )
+
+    prompt = f"""You are an expert digital marketing analyst scoring Meta Ads B2B franchise lead campaigns in India.
+
+INDUSTRY BENCHMARKS (Meta Ads B2B franchise sector, India):
+- Cost Per Lead (CPL): Excellent < ₹1500 (~$18) | Good < ₹4000 (~$48) | Average < ₹8000 (~$96) | Poor > ₹8000
+  Note: spend is in INR displayed as $. Treat $ as INR for benchmarking.
+- CTR: Excellent >= 3% | Good >= 1.5% | Average >= 0.8% | Poor < 0.8%
+- Lead Volume: Very High >= 5000 | High >= 1000 | Moderate >= 200 | Low >= 50 | Very Low > 0 | Zero = 0
+
+SCORING RULES (apply all, sum to 100):
+1. Lead Volume      [0-35 pts]: zero=0, very low=10, low=18, moderate=25, high=30, very high=35
+2. Cost Per Lead    [0-40 pts]: N/A(no leads)=0, very poor=5, poor=15, average=25, good=33, excellent=40
+3. CTR Quality      [0-15 pts]: poor=3, average=8, good=12, excellent=15
+4. Spend Efficiency [0-10 pts]: leads>0 and CPL excellent=10, good=7, average=4, poor=1; zero leads=0
+
+CAMPAIGN TO SCORE:
+Name: {name}
+Leads: {leads} ({lead_volume_rating})
+Total Spend: ${spend:.2f} (treat as INR)
+CPL: ${cpl:.2f} ({cpl_rating})
+CTR: {ctr:.2f}% ({ctr_rating})
+Impressions: {impressions:,}
+Clicks: {clicks:,}
+
+Apply the 4 rules above, sum the points, return ONLY the final integer score 0-100. No explanation. No text. Just the number.
+Score:"""
 
     for attempt in range(3):
         try:
