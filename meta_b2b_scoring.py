@@ -35,6 +35,54 @@ if not GROK_API_KEY:
 
 print(f"Using Ad Account ID: {META_AD_ACCOUNT_ID}")
 
+def validate_meta_token():
+    """
+    Diagnostic: verify the token is valid and list all accessible ad accounts.
+    This runs before any campaign fetch so misconfigurations are caught early.
+    """
+    base = "https://graph.facebook.com/v19.0"
+
+    # 1. Check token identity
+    me = requests.get(f"{base}/me", params={"access_token": META_ACCESS_TOKEN}).json()
+    if "error" in me:
+        print(f"[META DIAGNOSTIC] Token is INVALID or EXPIRED: {me['error']['message']}")
+        return False
+    print(f"[META DIAGNOSTIC] Token is valid. Authenticated as: {me.get('name', me.get('id', 'unknown'))}")
+
+    # 2. List all ad accounts this token can access
+    accounts_resp = requests.get(
+        f"{base}/me/adaccounts",
+        params={"access_token": META_ACCESS_TOKEN, "fields": "id,name,account_status"}
+    ).json()
+
+    if "error" in accounts_resp:
+        print(f"[META DIAGNOSTIC] Cannot list ad accounts: {accounts_resp['error']['message']}")
+        print("[META DIAGNOSTIC] Token may be missing 'ads_read' permission.")
+        return False
+
+    accounts = accounts_resp.get("data", [])
+    if not accounts:
+        print("[META DIAGNOSTIC] Token has access to 0 ad accounts. Check Business Manager permissions.")
+        return False
+
+    print(f"[META DIAGNOSTIC] Token can access {len(accounts)} ad account(s):")
+    found = False
+    for acc in accounts:
+        status_map = {1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW", 9: "IN_GRACE_PERIOD"}
+        status = status_map.get(acc.get("account_status"), f"STATUS_{acc.get('account_status')}")
+        marker = " <-- THIS ONE" if acc["id"] == META_AD_ACCOUNT_ID else ""
+        print(f"  - {acc['id']} | {acc.get('name', 'N/A')} | {status}{marker}")
+        if acc["id"] == META_AD_ACCOUNT_ID:
+            found = True
+
+    if not found:
+        print(f"[META DIAGNOSTIC] WARNING: '{META_AD_ACCOUNT_ID}' is NOT in the accessible accounts list above.")
+        print("[META DIAGNOSTIC] Update the META_AD_ACCOUNT_ID secret to one of the IDs listed above.")
+        return False
+
+    print(f"[META DIAGNOSTIC] Account {META_AD_ACCOUNT_ID} confirmed accessible. Proceeding...")
+    return True
+
 bq = None
 
 def get_bigquery_client():
@@ -255,6 +303,11 @@ def load_to_bigquery(meta_data, table_id):
 def main():
     print("Setting up BigQuery...")
     table_id = setup_bigquery()
+
+    print("Validating Meta token and account access...")
+    if not validate_meta_token():
+        print("Aborting: fix the Meta token/account ID issues above before proceeding.")
+        return
 
     print("Fetching Meta Ads data...")
     meta_data = fetch_meta_ads()
