@@ -215,14 +215,16 @@ B2B scoring criteria:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "grok-beta",
+                "model": "grok-3-mini",   # FIX: grok-beta is deprecated; use grok-3-mini
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 10,
                 "temperature": 0.1
             },
             timeout=30
         )
-        response.raise_for_status()
+        if not response.ok:
+            print(f"Grok HTTP {response.status_code}: {response.text}")
+            return 50
         raw = response.json()["choices"][0]["message"]["content"].strip()
         # Extract first integer found in the response (defensive parsing)
         import re
