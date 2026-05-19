@@ -13,9 +13,15 @@ from google.cloud import bigquery
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "meta_ads_b2b")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
-META_AD_ACCOUNT_ID = os.getenv("META_AD_ACCOUNT_ID")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 GROK_URL = "https://api.x.ai/v1/chat/completions"
+
+# FIX 1: Auto-add "act_" prefix if missing
+_raw_account_id = os.getenv("META_AD_ACCOUNT_ID", "")
+if _raw_account_id and not _raw_account_id.startswith("act_"):
+    META_AD_ACCOUNT_ID = f"act_{_raw_account_id}"
+else:
+    META_AD_ACCOUNT_ID = _raw_account_id
 
 # Validate required env vars
 if not GCP_PROJECT_ID:
@@ -26,6 +32,8 @@ if not META_AD_ACCOUNT_ID:
     raise ValueError("META_AD_ACCOUNT_ID environment variable is required")
 if not GROK_API_KEY:
     raise ValueError("GROK_API_KEY environment variable is required")
+
+print(f"Using Ad Account ID: {META_AD_ACCOUNT_ID}")
 
 bq = None
 
@@ -40,9 +48,11 @@ def setup_bigquery():
     dataset_id = f"{GCP_PROJECT_ID}.{BIGQUERY_DATASET}"
     try:
         bq.get_dataset(dataset_id)
-    except:
+        print(f"Dataset {dataset_id} already exists.")
+    except Exception:
         dataset = bigquery.Dataset(dataset_id)
         bq.create_dataset(dataset)
+        print(f"Created dataset {dataset_id}.")
 
     schema = [
         bigquery.SchemaField("campaign_id", "STRING"),
@@ -62,9 +72,11 @@ def setup_bigquery():
     table_id = f"{dataset_id}.campaign_scores"
     try:
         bq.get_table(table_id)
-    except:
+        print(f"Table {table_id} already exists.")
+    except Exception:
         table = bigquery.Table(table_id, schema=schema)
         bq.create_table(table)
+        print(f"Created table {table_id}.")
     return table_id
 
 def fetch_meta_ads():
@@ -73,12 +85,19 @@ def fetch_meta_ads():
     url = f"https://graph.facebook.com/v19.0/{META_AD_ACCOUNT_ID}/campaigns"
     params = {
         "access_token": META_ACCESS_TOKEN,
-        "fields": "id,name,status,insights.metric(leads,spend,impressions,clicks,ctr,cpm,cpp).period(lifetime)",
+        # FIX 2: "leads" is only available for Lead Generation objective campaigns.
+        # Using "actions" covers all conversion types including lead form submissions.
+        "fields": (
+            "id,name,status,"
+            "insights.date_preset(lifetime){"
+            "spend,impressions,clicks,ctr,cpm,cpp,actions"
+            "}"
+        ),
         "limit": 100
     }
 
     while url:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params if params else {})
         data = response.json()
 
         if "error" in data:
@@ -94,6 +113,25 @@ def fetch_meta_ads():
             params = None  # next URL already contains all params
 
     return {"data": all_campaigns}
+
+def extract_leads_from_actions(actions):
+    """
+    FIX 3: Extract lead count from the 'actions' array returned by Meta API.
+    Lead Generation campaigns report leads under action types like
+    'lead', 'onsite_conversion.lead_grouped', or 'offsite_conversion.fb_pixel_lead'.
+    """
+    if not actions:
+        return 0
+    lead_action_types = {
+        "lead",
+        "onsite_conversion.lead_grouped",
+        "offsite_conversion.fb_pixel_lead",
+    }
+    total_leads = 0
+    for action in actions:
+        if action.get("action_type") in lead_action_types:
+            total_leads += int(float(action.get("value", 0)))
+    return total_leads
 
 def get_grok_score(campaign_data):
     """Get AI-powered score from Grok (0-100)."""
@@ -135,7 +173,13 @@ B2B scoring criteria:
             },
             timeout=30
         )
-        return int(response.json()["choices"][0]["message"]["content"].strip())
+        response.raise_for_status()
+        raw = response.json()["choices"][0]["message"]["content"].strip()
+        # Extract first integer found in the response (defensive parsing)
+        import re
+        match = re.search(r"\d+", raw)
+        score = int(match.group()) if match else 50
+        return max(0, min(100, score))  # Clamp between 0-100
     except Exception as e:
         print(f"Grok error: {e}")
         return 50
@@ -153,21 +197,28 @@ def load_to_bigquery(meta_data, table_id):
     rows = []
 
     for campaign in meta_data.get("data", []):
-        insights = campaign.get("insights", {}).get("data", [{}])[0]
+        insights_list = campaign.get("insights", {}).get("data", [])
+        insights = insights_list[0] if insights_list else {}
 
-        leads = insights.get("leads", 0)
-        spend = insights.get("spend", 0.0)
-        cpl = 0.0
-        if leads > 0:
-            cpl = spend / leads
+        # FIX 4: Safe type casting — Meta API returns numeric fields as strings
+        spend = float(insights.get("spend", 0) or 0)
+        impressions = int(insights.get("impressions", 0) or 0)
+        clicks = int(insights.get("clicks", 0) or 0)
+        ctr = float(insights.get("ctr", 0) or 0)
+
+        # FIX 3: Use actions array to count leads
+        actions = insights.get("actions", [])
+        leads = extract_leads_from_actions(actions)
+
+        cpl = (spend / leads) if leads > 0 else 0.0
 
         campaign_data = {
             "name": campaign.get("name", ""),
             "leads": leads,
             "spend": spend,
-            "impressions": insights.get("impressions", 0),
-            "clicks": insights.get("clicks", 0),
-            "ctr": insights.get("ctr", 0.0),
+            "impressions": impressions,
+            "clicks": clicks,
+            "ctr": ctr,
             "cost_per_lead": cpl
         }
 
@@ -177,18 +228,18 @@ def load_to_bigquery(meta_data, table_id):
             "campaign_id": campaign["id"],
             "campaign_name": campaign.get("name", ""),
             "date": datetime.now().strftime("%Y-%m-%d"),
-            "spend": float(spend),
-            "impressions": int(insights.get("impressions", 0)),
-            "clicks": int(insights.get("clicks", 0)),
-            "leads": int(leads),
-            "cost_per_lead": float(cpl),
-            "ctr": float(insights.get("ctr", 0.0)),
+            "spend": spend,
+            "impressions": impressions,
+            "clicks": clicks,
+            "leads": leads,
+            "cost_per_lead": cpl,
+            "ctr": ctr,
             "grok_score": float(score),
             "grade": grade_from_score(score),
             "created_at": datetime.utcnow().isoformat()
         }
         rows.append(row)
-        print(f"Processed: {campaign.get('name')} -> Score: {score}")
+        print(f"Processed: {campaign.get('name')} | Leads: {leads} | Spend: ${spend:.2f} | Score: {score} ({grade_from_score(score)})")
 
     if not rows:
         print("No campaigns to load. Skipping BigQuery insert.")
@@ -196,7 +247,9 @@ def load_to_bigquery(meta_data, table_id):
 
     errors = bq.insert_rows_json(table_id, rows)
     if errors:
-        print(f"BigQuery errors: {errors}")
+        print(f"BigQuery insert errors: {errors}")
+    else:
+        print(f"Successfully inserted {len(rows)} rows into BigQuery.")
     return len(rows)
 
 def main():
@@ -205,7 +258,8 @@ def main():
 
     print("Fetching Meta Ads data...")
     meta_data = fetch_meta_ads()
-    print(f"Found {len(meta_data.get('data', []))} campaigns")
+    campaign_count = len(meta_data.get("data", []))
+    print(f"Found {campaign_count} campaigns")
 
     print("Scoring with Grok AI and loading to BigQuery...")
     count = load_to_bigquery(meta_data, table_id)
