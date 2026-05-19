@@ -135,9 +135,10 @@ def fetch_meta_ads():
         "access_token": META_ACCESS_TOKEN,
         # FIX 2: "leads" is only available for Lead Generation objective campaigns.
         # Using "actions" covers all conversion types including lead form submissions.
+        # "maximum" is the correct date_preset for all-time/lifetime data.
         "fields": (
             "id,name,status,"
-            "insights.date_preset(lifetime){"
+            "insights.date_preset(maximum){"
             "spend,impressions,clicks,ctr,cpm,cpp,actions"
             "}"
         ),
