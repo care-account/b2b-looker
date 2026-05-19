@@ -14,7 +14,7 @@ GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "meta_ads_b2b")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
-GROK_URL = "https://api.x.ai/v1/chat/completions"
+GROK_URL = "https://api.groq.com/openai/v1/chat/completions"  # FIX: Groq (groq.com), not xAI Grok
 
 # FIX 1: Auto-add "act_" prefix if missing
 _raw_account_id = os.getenv("META_AD_ACCOUNT_ID", "")
@@ -215,7 +215,7 @@ B2B scoring criteria:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "grok-3-mini",   # FIX: grok-beta is deprecated; use grok-3-mini
+                "model": "llama3-8b-8192",  # Groq-hosted LLaMA model
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 10,
                 "temperature": 0.1
