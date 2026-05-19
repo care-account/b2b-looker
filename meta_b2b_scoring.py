@@ -5,6 +5,8 @@ Uses Grok AI for scoring - GitHub Actions + BigQuery (Free Tier)
 """
 
 import os
+import time
+import re
 import requests
 from datetime import datetime
 from google.cloud import bigquery
@@ -183,7 +185,9 @@ def extract_leads_from_actions(actions):
     return total_leads
 
 def get_grok_score(campaign_data):
-    """Get AI-powered score from Grok (0-100)."""
+    """Get AI-powered score from Groq (0-100) with rate-limit retry."""
+    import time, re
+
     name = campaign_data.get('name', 'Unknown')
     leads = campaign_data.get('leads', 0)
     spend = campaign_data.get('spend', 0.0)
@@ -192,48 +196,66 @@ def get_grok_score(campaign_data):
     ctr = campaign_data.get('ctr', 0.0)
     cpl = campaign_data.get('cost_per_lead', 0.0)
 
-    prompt = f"""Score this Meta Ads B2B lead campaign 0-100:
-Campaign: {name}
-Leads: {leads}
-Spend: ${spend:.2f}
-Impressions: {impressions}
-Clicks: {clicks}
-CTR: {ctr:.2%}
-CPL: ${cpl:.2f}
+    # Strict prompt: no explanation, no fractions, just a plain integer
+    prompt = (
+        f"You are a B2B ad campaign scorer. "
+        f"Reply with a SINGLE integer between 0 and 100. No text, no explanation, no fraction. "
+        f"Score based on: high leads + low cost-per-lead = high score; zero leads = low score.\n\n"
+        f"Campaign: {name}\n"
+        f"Leads: {leads}\n"
+        f"Spend: ${spend:.2f}\n"
+        f"Impressions: {impressions}\n"
+        f"Clicks: {clicks}\n"
+        f"CTR: {ctr:.2f}%\n"
+        f"CPL: ${cpl:.2f}\n\n"
+        f"Score (integer 0-100):"
+    )
 
-B2B scoring criteria:
-- High lead count + low CPL = high score
-- Good CTR indicates relevance
-- Return only integer 0-100.
-"""
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                GROK_URL,
+                headers={
+                    "Authorization": f"Bearer {GROK_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 5,
+                    "temperature": 0.0
+                },
+                timeout=30
+            )
 
-    try:
-        response = requests.post(
-            GROK_URL,
-            headers={
-                "Authorization": f"Bearer {GROK_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": "llama-3.1-8b-instant",  # Current Groq model (replaces deprecated llama3-8b-8192)
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 10,
-                "temperature": 0.1
-            },
-            timeout=30
-        )
-        if not response.ok:
-            print(f"Grok HTTP {response.status_code}: {response.text}")
+            # Rate limit: wait and retry
+            if response.status_code == 429:
+                wait = 2 * (attempt + 1)
+                print(f"  Rate limited — waiting {wait}s before retry...")
+                time.sleep(wait)
+                continue
+
+            if not response.ok:
+                print(f"Groq HTTP {response.status_code}: {response.text}")
+                return 50
+
+            raw = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Match a 1-3 digit number (whole response)
+            match = re.search(r"\b(\d{1,3})\b", raw)
+            if match:
+                score = int(match.group(1))
+                return max(0, min(100, score))
+            else:
+                print(f"  Unexpected Groq response: '{raw}' — defaulting to 50")
+                return 50
+
+        except Exception as e:
+            print(f"Groq error: {e}")
             return 50
-        raw = response.json()["choices"][0]["message"]["content"].strip()
-        # Extract first integer found in the response (defensive parsing)
-        import re
-        match = re.search(r"\d+", raw)
-        score = int(match.group()) if match else 50
-        return max(0, min(100, score))  # Clamp between 0-100
-    except Exception as e:
-        print(f"Grok error: {e}")
-        return 50
+
+    print("  All retries exhausted — defaulting to 50")
+    return 50
 
 def grade_from_score(score):
     if score >= 85: return "A"
@@ -274,6 +296,7 @@ def load_to_bigquery(meta_data, table_id):
         }
 
         score = get_grok_score(campaign_data)
+        time.sleep(2.1)  # Stay under 30 RPM free tier limit (2s between calls)
 
         row = {
             "campaign_id": campaign["id"],
