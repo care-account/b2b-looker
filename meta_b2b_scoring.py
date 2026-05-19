@@ -215,7 +215,7 @@ B2B scoring criteria:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "llama3-8b-8192",  # Groq-hosted LLaMA model
+                "model": "llama-3.1-8b-instant",  # Current Groq model (replaces deprecated llama3-8b-8192)
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 10,
                 "temperature": 0.1
