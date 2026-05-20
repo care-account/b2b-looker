@@ -46,5 +46,5 @@ jobs:
           GROK_API_KEY:       ${{ secrets.GROK_API_KEY }}
           # Historical backfill start — only used on the very first run
           # (or if you override via manual dispatch)
-          LEADS_START_DATE: ${{ github.event.inputs.start_date || secrets.LEADS_START_DATE || '2024-01-01' }}
+          LEADS_START_DATE: ${{ github.event.inputs.start_date || secrets.LEADS_START_DATE || '2026-01-01' }}
         run: python meta_lead_scoring.py
