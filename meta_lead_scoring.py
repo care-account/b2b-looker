@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 FABO B2B Lead Scorer — Individual Store Opener Prediction
+- Fetches leads from ALL ads (no campaign objective filter)
 - Incremental fetch: only new leads since last scored lead (or LEADS_START_DATE)
 - Scores each person with Groq AI and loads to BigQuery
-- Uses campaigns → ads route (no forms API needed)
 """
 
 import os
@@ -17,7 +17,7 @@ from google.cloud import bigquery
 GCP_PROJECT_ID    = os.getenv("GCP_PROJECT_ID")
 BIGQUERY_DATASET  = os.getenv("BIGQUERY_DATASET", "meta_ads_b2b")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
-GROQ_API_KEY      = os.getenv("GROK_API_KEY") or os.getenv("GROQ_API_KEY")  # accept both names
+GROQ_API_KEY      = os.getenv("GROK_API_KEY") or os.getenv("GROQ_API_KEY")
 GROQ_URL          = "https://api.groq.com/openai/v1/chat/completions"
 
 LEADS_START_DATE  = os.getenv("LEADS_START_DATE", "2024-01-01")
@@ -101,7 +101,6 @@ def get_fetch_since_timestamp(table_id):
         result = list(bq.query(query).result())
         latest = result[0].latest if result else None
         if latest:
-            # Add 1 second to avoid re‑fetching the exact last lead
             since = latest + timedelta(seconds=1)
             since_str = since.strftime("%Y-%m-%dT%H:%M:%S+00:00")
             print(f"Incremental mode: fetching leads submitted after {since_str} (UTC)")
@@ -130,14 +129,14 @@ def paginate(url, params):
         params = None
     return results, None
 
-def fetch_all_lead_ads():
+def fetch_all_ads():
     """
-    Fetch all Lead Generation ads from the account.
+    Fetch ALL campaigns and ALL ads (regardless of objective).
     Returns list of ads with campaign metadata attached.
     """
     base = "https://graph.facebook.com/v19.0"
 
-    # 1. Get all campaigns
+    # 1. Fetch all campaigns
     campaigns, err = paginate(
         f"{base}/{META_AD_ACCOUNT_ID}/campaigns",
         {"access_token": META_ACCESS_TOKEN,
@@ -148,16 +147,15 @@ def fetch_all_lead_ads():
         print(f"[META] Campaign fetch error: {err}")
         return []
 
-    lead_campaigns = [c for c in campaigns if c.get("objective") == "LEAD_GENERATION"]
-    print(f"  Campaigns total: {len(campaigns)}, lead gen: {len(lead_campaigns)}")
+    print(f"  Total campaigns found: {len(campaigns)}")
 
     # 2. For each campaign, fetch its ads
     all_ads = []
-    for camp in lead_campaigns:
+    for camp in campaigns:
         ads, err = paginate(
             f"{base}/{camp['id']}/ads",
             {"access_token": META_ACCESS_TOKEN,
-             "fields": "id,name,status,creative{object_story_spec}",
+             "fields": "id,name,status",
              "limit": 100}
         )
         if err:
@@ -166,15 +164,17 @@ def fetch_all_lead_ads():
         for ad in ads:
             ad["_campaign_id"]   = camp["id"]
             ad["_campaign_name"] = camp["name"]
+            ad["_campaign_objective"] = camp.get("objective", "unknown")
         all_ads.extend(ads)
 
-    print(f"  Total lead gen ads found: {len(all_ads)}")
+    print(f"  Total ads fetched: {len(all_ads)}")
     return all_ads
 
 def fetch_leads_from_ad(ad_id, ad_name, campaign_id, campaign_name, since_ts, until_ts):
     """
     Fetch leads from a single ad using /{ad_id}/leads.
     Returns list of leads (raw from Meta) with ad/campaign metadata attached.
+    Returns empty list if ad has no leads or API error (code 100).
     """
     base = "https://graph.facebook.com/v19.0"
     url = f"{base}/{ad_id}/leads"
@@ -191,7 +191,7 @@ def fetch_leads_from_ad(ad_id, ad_name, campaign_id, campaign_name, since_ts, un
     while url:
         r = requests.get(url, params=params if params else {}).json()
         if "error" in r:
-            # code 100 = no leads on this ad yet – not an error
+            # Code 100 = no leads on this ad (not a real error)
             if r["error"].get("code") != 100:
                 print(f"    Ad {ad_id} error: {r['error']['message']}")
             break
@@ -207,7 +207,7 @@ def fetch_leads_from_ad(ad_id, ad_name, campaign_id, campaign_name, since_ts, un
             lead["ad_name"]      = ad_name
             lead["campaign_id"]  = campaign_id
             lead["campaign_name"]= campaign_name
-            lead["_form_name"]   = ""   # not available via ad route
+            lead["_form_name"]   = ""
             leads.append(lead)
 
         url = r.get("paging", {}).get("next")
@@ -360,25 +360,24 @@ def main():
     print("\nSetting up BigQuery...")
     table_id = setup_bigquery()
 
-    # Determine fetch window
     since_ts = get_fetch_since_timestamp(table_id)
     until_ts = now_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     print(f"Fetch window : {since_ts}  →  {until_ts}")
 
-    # Load already scored IDs to skip duplicates
     already_scored = get_already_scored_lead_ids(table_id)
 
-    # Fetch all lead‑generation ads
-    print("\nFetching lead generation ads...")
-    ads = fetch_all_lead_ads()
+    # Fetch ALL ads (no campaign objective filter)
+    print("\nFetching all ads from account...")
+    ads = fetch_all_ads()
     if not ads:
-        print("No lead generation ads found.")
+        print("No ads found in the account.")
         return
 
     # Collect new leads from all ads
     all_leads = []
     for ad in ads:
-        print(f"  Ad: {ad['name']} ({ad['id']})")
+        # Optional: print progress for first 10 ads to avoid spam
+        print(f"  Checking ad: {ad['name'][:50]} ({ad['id']})", end=" ")
         raw_leads = fetch_leads_from_ad(
             ad["id"], ad["name"],
             ad["_campaign_id"], ad["_campaign_name"],
@@ -386,7 +385,7 @@ def main():
         )
         parsed = [parse_lead_fields(l) for l in raw_leads]
         new = [l for l in parsed if l["lead_id"] not in already_scored]
-        print(f"    → {len(raw_leads)} fetched, {len(new)} new")
+        print(f"→ {len(raw_leads)} fetched, {len(new)} new")
         all_leads.extend(new)
 
     print(f"\nNew leads to score : {len(all_leads)}")
