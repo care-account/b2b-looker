@@ -1,16 +1,21 @@
-name: Meta Ads B2B Scoring
+name: Meta Lead Store Opener Scoring
 
 on:
   schedule:
-    # Run daily at 9 AM UTC
-    - cron: '0 9 * * *'
-  workflow_dispatch:
+    - cron: '0 9 * * *'   # Daily 9 AM UTC (2:30 PM IST)
+
+  workflow_dispatch:        # Manual trigger with optional date override
+    inputs:
+      start_date:
+        description: 'Override start date (YYYY-MM-DD). Leave blank to auto-detect from BigQuery.'
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
 jobs:
-  score-campaigns:
+  score-leads:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,8 +25,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install google-cloud-bigquery requests
+        run: pip install google-cloud-bigquery requests
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -33,11 +37,14 @@ jobs:
         with:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
-      - name: Run scoring
+      - name: Score leads
         env:
-          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-          BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
-          META_ACCESS_TOKEN: ${{ secrets.META_ACCESS_TOKEN }}
+          GCP_PROJECT_ID:     ${{ secrets.GCP_PROJECT_ID }}
+          BIGQUERY_DATASET:   ${{ secrets.BIGQUERY_DATASET }}
+          META_ACCESS_TOKEN:  ${{ secrets.META_ACCESS_TOKEN }}
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
-          GROK_API_KEY: ${{ secrets.GROK_API_KEY }}
-        run: python meta_b2b_scoring.py
+          GROK_API_KEY:       ${{ secrets.GROK_API_KEY }}
+          # Historical backfill start — only used on the very first run
+          # (or if you override via manual dispatch)
+          LEADS_START_DATE: ${{ github.event.inputs.start_date || secrets.LEADS_START_DATE || '2024-01-01' }}
+        run: python meta_lead_scoring.py
