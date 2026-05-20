@@ -44,7 +44,7 @@ jobs:
           META_ACCESS_TOKEN:  ${{ secrets.META_ACCESS_TOKEN }}
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
           GROK_API_KEY:       ${{ secrets.GROK_API_KEY }}
-          # Historical backfill start — only used on the very first run
-          # (or if you override via manual dispatch)
+          # LEADS_START_DATE: used only on first run (or when BigQuery empty)
+          # Manual override takes precedence; otherwise use secret; fallback to 2026-01-01
           LEADS_START_DATE: ${{ github.event.inputs.start_date || secrets.LEADS_START_DATE || '2026-01-01' }}
         run: python meta_lead_scoring.py
