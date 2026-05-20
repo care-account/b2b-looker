@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FABO B2B Lead Scorer — Individual Store Opener Prediction
-- Fetches leads from all Lead Forms in the ad account
+- Fetches leads from all Lead Forms in the ad account (requires leads_retrieval)
 - Incremental: only new leads since last scored lead (or LEADS_START_DATE)
 - Scores each person with Groq AI and loads to BigQuery
 """
@@ -101,7 +101,6 @@ def get_fetch_since_timestamp(table_id):
         result = list(bq.query(query).result())
         latest = result[0].latest if result else None
         if latest:
-            # Add 1 second to avoid re‑fetching the exact last lead
             since = latest + timedelta(seconds=1)
             since_str = since.strftime("%Y-%m-%dT%H:%M:%S+00:00")
             print(f"Incremental mode: fetching leads submitted after {since_str} (UTC)")
@@ -109,7 +108,6 @@ def get_fetch_since_timestamp(table_id):
     except Exception as e:
         print(f"Could not determine latest timestamp: {e}")
 
-    # Fallback: full backfill from start date
     since_str = f"{LEADS_START_DATE}T00:00:00+00:00"
     print(f"Full backfill mode: fetching all leads from {LEADS_START_DATE} to today")
     return since_str
@@ -120,7 +118,6 @@ def iso_to_unix(iso_str):
     return int(dt.timestamp())
 
 def paginate(url, params):
-    """Generic paginator for Meta Graph API."""
     results = []
     while url:
         r = requests.get(url, params=params if params else {}).json()
@@ -132,10 +129,7 @@ def paginate(url, params):
     return results, None
 
 def fetch_all_lead_forms():
-    """
-    Fetch all Lead Generation forms from the ad account.
-    Returns list of forms with id, name, status, etc.
-    """
+    """Fetch all Lead Generation forms from the ad account."""
     base = "https://graph.facebook.com/v19.0"
     url = f"{base}/{META_AD_ACCOUNT_ID}/leadgen_forms"
     params = {
@@ -145,15 +139,19 @@ def fetch_all_lead_forms():
     }
     forms, err = paginate(url, params)
     if err:
-        print(f"[META] Form fetch error: {err}")
+        if "leadgen_forms" in str(err) and "nonexisting field" in str(err):
+            print("\n❌ PERMISSION ERROR: Your Meta access token is missing 'leads_retrieval'.\n"
+                  "   To fix: Add the 'Capture & manage ad leads with Marketing API' use case to your app,\n"
+                  "   then generate a new token (System User token recommended).\n"
+                  "   See instructions in the conversation or Meta developer docs.\n")
+        else:
+            print(f"[META] Form fetch error: {err}")
         return []
     print(f"  Total lead forms found: {len(forms)}")
     return forms
 
 def fetch_leads_from_form(form_id, form_name, since_ts, until_ts):
-    """
-    Fetch leads from a specific form using /{form_id}/leads.
-    """
+    """Fetch leads from a specific form using /{form_id}/leads."""
     base = "https://graph.facebook.com/v19.0"
     url = f"{base}/{form_id}/leads"
     until_dt = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
@@ -169,8 +167,7 @@ def fetch_leads_from_form(form_id, form_name, since_ts, until_ts):
     while url:
         r = requests.get(url, params=params if params else {}).json()
         if "error" in r:
-            # Code 100 = no leads on this form – skip
-            if r["error"].get("code") != 100:
+            if r["error"].get("code") != 100:  # 100 = no leads
                 print(f"    Form {form_id} error: {r['error']['message']}")
             break
 
@@ -194,7 +191,6 @@ def parse_lead_fields(lead):
     """Convert Meta's field_data array into a clean dict."""
     raw = {}
     for f in lead.get("field_data", []):
-        # field_data can have 'values' list, take first non-empty
         values = f.get("values", [])
         raw[f["name"]] = values[0] if values else ""
 
@@ -251,7 +247,6 @@ def precompute_signal_scores(lead):
     return inv_s, tl_s, ei_s
 
 def get_ai_score(lead):
-    """Ask Groq to predict store‑opener likelihood 0–100."""
     inv_s, tl_s, ei_s = precompute_signal_scores(lead)
     rule_total = inv_s + tl_s + ei_s
 
@@ -317,7 +312,6 @@ Score:"""
         except Exception as e:
             print(f"  Groq error: {e}")
             return rule_total
-
     return rule_total
 
 def grade_from_score(score):
@@ -344,14 +338,12 @@ def main():
 
     already_scored = get_already_scored_lead_ids(table_id)
 
-    # Fetch all lead forms
     print("\nFetching lead forms from Meta...")
     forms = fetch_all_lead_forms()
     if not forms:
         print("No lead forms found. Check token permissions (need leads_retrieval).")
         return
 
-    # Collect new leads from all forms
     all_leads = []
     for form in forms:
         print(f"  Form: {form['name']} ({form['id']})")
@@ -366,13 +358,12 @@ def main():
         print("Nothing new to score — BigQuery is up to date.")
         return
 
-    # Score each lead with Groq and insert into BigQuery
     print("\nScoring with Groq AI...")
     rows = []
     for i, lead in enumerate(all_leads, 1):
         score = get_ai_score(lead)
         grade = grade_from_score(score)
-        time.sleep(2.1)  # stay under 30 RPM free tier
+        time.sleep(2.1)
 
         ts = lead["lead_created_time"]
         try:
@@ -414,7 +405,6 @@ def main():
     else:
         print(f"Successfully loaded {len(rows)} lead scores → {table_id}")
 
-    # Summary
     grades = {"A":0,"B":0,"C":0,"D":0,"F":0}
     for r in rows:
         grades[r["grade"]] += 1
