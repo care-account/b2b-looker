@@ -143,8 +143,22 @@ def fetch_lead_gen_ads():
         print(f"[META] Campaign fetch error: {err}")
         return []
 
-    lead_camps = [c for c in campaigns if c.get("objective") == "LEAD_GENERATION"]
+    # Meta renamed the objective in 2022:
+    # Old campaigns: "LEAD_GENERATION"
+    # New campaigns: "OUTCOME_LEADS"
+    LEAD_OBJECTIVES = {"LEAD_GENERATION", "OUTCOME_LEADS"}
+    lead_camps = [c for c in campaigns if c.get("objective") in LEAD_OBJECTIVES]
+
+    # Print all unique objectives found for diagnostics
+    all_objectives = sorted(set(c.get("objective", "UNKNOWN") for c in campaigns))
     print(f"  Campaigns total: {len(campaigns)}, lead gen: {len(lead_camps)}")
+    print(f"  Objectives found: {all_objectives}")
+
+    # Fallback: if no campaigns matched known lead objectives, try ALL campaigns
+    # (handles custom objectives or API changes)
+    if not lead_camps:
+        print("  No matching lead objectives — falling back to ALL campaigns to find lead ads")
+        lead_camps = campaigns
 
     all_ads = []
     for camp in lead_camps:
