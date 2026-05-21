@@ -139,16 +139,12 @@ def fetch_all_lead_forms():
     }
     forms, err = paginate(url, params)
     if err:
-        if "leadgen_forms" in str(err) and "nonexisting field" in str(err):
-            print("\n❌ PERMISSION ERROR: Your Meta access token is missing 'leads_retrieval'.\n"
-                  "   To fix: Add the 'Capture & manage ad leads with Marketing API' use case to your app,\n"
-                  "   then generate a new token (System User token recommended).\n"
-                  "   See instructions in the conversation or Meta developer docs.\n")
-        else:
-            print(f"[META] Form fetch error: {err}")
+        print(f"[META] Form fetch error: {err}")
+        print("[META] Tip: make sure your META_ACCESS_TOKEN secret uses the newly generated token with leads_retrieval permission.")
         return []
-    print(f"  Total lead forms found: {len(forms)}")
-    return forms
+    active = [f for f in forms if f.get("status") != "ARCHIVED"]
+    print(f"  Total lead forms: {len(forms)}, active: {len(active)}")
+    return active
 
 def fetch_leads_from_form(form_id, form_name, since_ts, until_ts):
     """Fetch leads from a specific form using /{form_id}/leads."""
