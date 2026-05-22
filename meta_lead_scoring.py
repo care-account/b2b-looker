@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 FABO B2B Lead Scorer — Individual Store Opener Prediction
-- Fetches leads from all Lead Forms in the ad account (requires leads_retrieval)
-- Incremental: only new leads since last scored lead (or LEADS_START_DATE)
-- Scores each person with Groq AI and loads to BigQuery
+Fetches leads via leadgen_forms (with leads_retrieval permission)
+Incremental: only new leads since last run. Full backfill on first run.
+Scores each lead with Groq AI and stores to BigQuery.
 """
 
 import os
@@ -13,27 +13,32 @@ import requests
 from datetime import datetime, timezone, timedelta
 from google.cloud import bigquery
 
-# ── Config (GitHub Secrets) ───────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 GCP_PROJECT_ID    = os.getenv("GCP_PROJECT_ID")
 BIGQUERY_DATASET  = os.getenv("BIGQUERY_DATASET", "meta_ads_b2b")
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 GROQ_API_KEY      = os.getenv("GROK_API_KEY") or os.getenv("GROQ_API_KEY")
 GROQ_URL          = "https://api.groq.com/openai/v1/chat/completions"
-
-LEADS_START_DATE  = os.getenv("LEADS_START_DATE", "2024-01-01")
+LEADS_START_DATE  = os.getenv("LEADS_START_DATE", "2026-01-01")
+GRAPH_VER         = "v19.0"
+BASE              = f"https://graph.facebook.com/{GRAPH_VER}"
 
 _raw = os.getenv("META_AD_ACCOUNT_ID", "")
 META_AD_ACCOUNT_ID = f"act_{_raw}" if _raw and not _raw.startswith("act_") else _raw
 
-for var, val in [("GCP_PROJECT_ID", GCP_PROJECT_ID), ("META_ACCESS_TOKEN", META_ACCESS_TOKEN),
-                 ("META_AD_ACCOUNT_ID", META_AD_ACCOUNT_ID), ("GROQ_API_KEY", GROQ_API_KEY)]:
+for var, val in [
+    ("GCP_PROJECT_ID",   GCP_PROJECT_ID),
+    ("META_ACCESS_TOKEN",META_ACCESS_TOKEN),
+    ("META_AD_ACCOUNT_ID",META_AD_ACCOUNT_ID),
+    ("GROK_API_KEY",     GROQ_API_KEY),
+]:
     if not val:
         raise ValueError(f"{var} environment variable is required")
 
-print(f"Using Ad Account : {META_AD_ACCOUNT_ID}")
-print(f"Historical start : {LEADS_START_DATE}")
+print(f"Ad Account      : {META_AD_ACCOUNT_ID}")
+print(f"Start date      : {LEADS_START_DATE}")
 
-# ── BigQuery helpers ──────────────────────────────────────────────────────────
+# ── BigQuery ──────────────────────────────────────────────────────────────────
 bq = None
 
 def get_bq():
@@ -49,8 +54,9 @@ def setup_bigquery():
         bq.get_dataset(dataset_id)
     except Exception:
         bq.create_dataset(bigquery.Dataset(dataset_id))
-        print(f"Created dataset {dataset_id}")
+        print(f"  Created dataset {dataset_id}")
 
+    # FIX: added inv_score, tl_score, et_score columns for score breakdown
     schema = [
         bigquery.SchemaField("lead_id",           "STRING"),
         bigquery.SchemaField("lead_name",          "STRING"),
@@ -67,196 +73,265 @@ def setup_bigquery():
         bigquery.SchemaField("ad_name",            "STRING"),
         bigquery.SchemaField("form_name",          "STRING"),
         bigquery.SchemaField("lead_created_time",  "TIMESTAMP"),
-        bigquery.SchemaField("store_open_score",   "FLOAT"),
+        bigquery.SchemaField("inv_score",          "INTEGER"),   # /40
+        bigquery.SchemaField("tl_score",           "INTEGER"),   # /35
+        bigquery.SchemaField("et_score",           "INTEGER"),   # /25
+        bigquery.SchemaField("store_open_score",   "FLOAT"),     # /100
         bigquery.SchemaField("grade",              "STRING"),
         bigquery.SchemaField("scored_at",          "TIMESTAMP"),
     ]
 
     table_id = f"{dataset_id}.lead_scores"
     try:
-        bq.get_table(table_id)
-        print(f"Table {table_id} already exists.")
+        existing = bq.get_table(table_id)
+        # FIX: add missing columns to existing table if needed
+        existing_cols = {f.name for f in existing.schema}
+        new_fields = [f for f in schema if f.name not in existing_cols]
+        if new_fields:
+            existing.schema = list(existing.schema) + new_fields
+            bq.update_table(existing, ["schema"])
+            print(f"  Added {len(new_fields)} new columns to existing table")
+        else:
+            print(f"  Table {table_id} up to date.")
     except Exception:
         bq.create_table(bigquery.Table(table_id, schema=schema))
-        print(f"Created table {table_id}")
+        print(f"  Created table {table_id}")
     return table_id
 
-def get_already_scored_lead_ids(table_id):
+def get_already_scored_ids(table_id):
     get_bq()
-    query = f"SELECT lead_id FROM `{table_id}`"
     try:
-        result = bq.query(query).result()
-        ids = {row.lead_id for row in result}
-        print(f"Already scored in BigQuery: {len(ids)} leads (will skip these)")
+        rows = bq.query(f"SELECT lead_id FROM `{table_id}`").result()
+        ids = {row.lead_id for row in rows}
+        print(f"  Already in BigQuery: {len(ids)} leads (will skip duplicates)")
         return ids
     except Exception as e:
-        print(f"Could not query existing leads (table may be empty): {e}")
+        print(f"  Could not query existing IDs: {e}")
         return set()
 
-def get_fetch_since_timestamp(table_id):
-    """Return timestamp to fetch leads FROM (incremental or full backfill)."""
+def get_since_timestamp(table_id):
+    """Incremental: use MAX timestamp from BQ. First run: use LEADS_START_DATE."""
     get_bq()
-    query = f"SELECT MAX(lead_created_time) AS latest FROM `{table_id}`"
     try:
-        result = list(bq.query(query).result())
-        latest = result[0].latest if result else None
+        rows = list(bq.query(
+            f"SELECT MAX(lead_created_time) AS latest FROM `{table_id}`"
+        ).result())
+        latest = rows[0].latest if rows else None
         if latest:
             since = latest + timedelta(seconds=1)
             since_str = since.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-            print(f"Incremental mode: fetching leads submitted after {since_str} (UTC)")
+            print(f"  Incremental mode — fetching leads after {since_str}")
             return since_str
     except Exception as e:
-        print(f"Could not determine latest timestamp: {e}")
+        print(f"  Timestamp query failed: {e}")
 
     since_str = f"{LEADS_START_DATE}T00:00:00+00:00"
-    print(f"Full backfill mode: fetching all leads from {LEADS_START_DATE} to today")
+    print(f"  Full backfill — fetching from {LEADS_START_DATE} to today")
     return since_str
 
-# ── Meta API helpers ──────────────────────────────────────────────────────────
+# ── Meta helpers ──────────────────────────────────────────────────────────────
 def iso_to_unix(iso_str):
-    dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    return int(dt.timestamp())
+    return int(datetime.fromisoformat(iso_str.replace("Z", "+00:00")).timestamp())
 
-def paginate(url, params):
+def meta_paginate(url, params):
+    """
+    Paginate Meta Graph API with rate-limit retry.
+    Returns (results_list, error_string_or_None)
+    """
     results = []
     while url:
-        r = requests.get(url, params=params if params else {}).json()
-        if "error" in r:
-            return results, r["error"]["message"]
+        for attempt in range(4):
+            try:
+                r = requests.get(url, params=params if params else {}, timeout=30).json()
+            except Exception as e:
+                return results, str(e)
+
+            if "error" in r:
+                msg  = r["error"].get("message", "")
+                code = r["error"].get("code", 0)
+                # Rate limit codes: 17, 80004, or message contains "too many"
+                if code in (17, 80004) or "too many" in msg.lower():
+                    wait = 30 * (attempt + 1)
+                    print(f"    Rate limited — waiting {wait}s (attempt {attempt+1}/4)")
+                    time.sleep(wait)
+                    continue
+                return results, msg
+            break
+        else:
+            return results, "Rate limit: all retries exhausted"
+
         results.extend(r.get("data", []))
-        url = r.get("paging", {}).get("next")
+        url    = r.get("paging", {}).get("next")
         params = None
+        time.sleep(0.3)   # gentle inter-page pause
     return results, None
 
-def fetch_lead_gen_ads():
-    """
-    Route: ad_account -> LEAD_GENERATION campaigns -> ads
-    Works with ads_read only. No leadgen_forms / leads_retrieval needed.
-    """
-    base = "https://graph.facebook.com/v19.0"
-    campaigns, err = paginate(
-        f"{base}/{META_AD_ACCOUNT_ID}/campaigns",
+def validate_token():
+    me = requests.get(f"{BASE}/me",
+        params={"access_token": META_ACCESS_TOKEN}, timeout=15).json()
+    if "error" in me:
+        print(f"  Token INVALID: {me['error']['message']}")
+        return False
+    print(f"  Token OK — authenticated as: {me.get('name', me.get('id'))}")
+    return True
+
+# ── FIX: dual fetch strategy ──────────────────────────────────────────────────
+# Strategy 1: /leadgen_forms  (needs leads_retrieval — token has it now)
+# Strategy 2: campaigns → ads → /leads  (fallback, needs only ads_read)
+# We try both and merge, deduplicated by lead id.
+
+def fetch_via_forms(since_ts, until_ts):
+    """Fetch all leads via leadgen_forms endpoint."""
+    until_dt = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
+
+    forms, err = meta_paginate(
+        f"{BASE}/{META_AD_ACCOUNT_ID}/leadgen_forms",
+        {"access_token": META_ACCESS_TOKEN,
+         "fields": "id,name,status", "limit": 100}
+    )
+    if err:
+        print(f"  [forms] Error: {err}")
+        return {}
+
+    active = [f for f in forms if f.get("status") != "ARCHIVED"]
+    print(f"  [forms] {len(active)} active forms found")
+
+    leads_by_id = {}
+    for form in active:
+        page_leads, err = meta_paginate(
+            f"{BASE}/{form['id']}/leads",
+            {
+                "access_token": META_ACCESS_TOKEN,
+                "fields": "id,created_time,field_data,platform,"
+                          "ad_id,ad_name,campaign_id,campaign_name",
+                "filtering": f'[{{"field":"time_created","operator":"GREATER_THAN",'
+                             f'"value":{iso_to_unix(since_ts)}}}]',
+                "limit": 100,
+            }
+        )
+        if err and "100" not in str(err):
+            print(f"    Form '{form['name']}' error: {err}")
+            continue
+
+        for lead in page_leads:
+            try:
+                if datetime.fromisoformat(
+                    lead["created_time"].replace("Z", "+00:00")) > until_dt:
+                    continue
+            except Exception:
+                pass
+            lead["_form_name"] = form["name"]
+            leads_by_id[lead["id"]] = lead
+
+        print(f"    Form '{form['name']}': {len(page_leads)} leads")
+
+    return leads_by_id
+
+def fetch_via_ads(since_ts, until_ts):
+    """Fetch leads via campaign → ads → /leads (fallback route)."""
+    until_dt = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
+
+    campaigns, err = meta_paginate(
+        f"{BASE}/{META_AD_ACCOUNT_ID}/campaigns",
         {"access_token": META_ACCESS_TOKEN,
          "fields": "id,name,objective,status", "limit": 100}
     )
     if err:
-        print(f"[META] Campaign fetch error: {err}")
-        return []
+        print(f"  [ads] Campaign error: {err}")
+        return {}
 
-    # Meta renamed the objective in 2022:
-    # Old campaigns: "LEAD_GENERATION"
-    # New campaigns: "OUTCOME_LEADS"
-    LEAD_OBJECTIVES = {"LEAD_GENERATION", "OUTCOME_LEADS"}
-    lead_camps = [c for c in campaigns if c.get("objective") in LEAD_OBJECTIVES]
-
-    # Print all unique objectives found for diagnostics
-    all_objectives = sorted(set(c.get("objective", "UNKNOWN") for c in campaigns))
-    print(f"  Campaigns total: {len(campaigns)}, lead gen: {len(lead_camps)}")
-    print(f"  Objectives found: {all_objectives}")
-
-    # Fallback: if no campaigns matched known lead objectives, try ALL campaigns
-    # (handles custom objectives or API changes)
+    # Accept all objective names (Meta keeps renaming them)
+    lead_objectives = {"LEAD_GENERATION", "OUTCOME_LEADS"}
+    lead_camps = [c for c in campaigns if c.get("objective") in lead_objectives]
     if not lead_camps:
-        print("  No matching lead objectives — falling back to ALL campaigns to find lead ads")
-        lead_camps = campaigns
+        lead_camps = campaigns   # last resort: try all
+    print(f"  [ads] {len(lead_camps)} campaigns to check")
 
-    all_ads = []
+    leads_by_id = {}
     for camp in lead_camps:
-        ads, err = paginate(
-            f"{base}/{camp['id']}/ads",
+        ads, err = meta_paginate(
+            f"{BASE}/{camp['id']}/ads",
             {"access_token": META_ACCESS_TOKEN,
              "fields": "id,name,status", "limit": 100}
         )
         if err:
-            print(f"  Campaign '{camp['name']}' ads error: {err}")
             continue
         for ad in ads:
-            ad["_campaign_id"]   = camp["id"]
-            ad["_campaign_name"] = camp["name"]
-        all_ads.extend(ads)
-
-    print(f"  Total lead gen ads: {len(all_ads)}")
-    return all_ads
-
-def fetch_leads_from_ad(ad, since_ts, until_ts):
-    """Fetch leads from a single ad. Works with ads_read permission."""
-    base     = "https://graph.facebook.com/v19.0"
-    until_dt = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
-    url      = f"{base}/{ad['id']}/leads"
-    params   = {
-        "access_token": META_ACCESS_TOKEN,
-        "fields": "id,created_time,field_data,platform,campaign_id,campaign_name,ad_name",
-        "filtering": f'[{{"field":"time_created","operator":"GREATER_THAN","value":{iso_to_unix(since_ts)}}}]',
-        "limit": 100,
-    }
-    leads = []
-    while url:
-        r = requests.get(url, params=params if params else {}).json()
-        if "error" in r:
-            if r["error"].get("code") != 100:
-                print(f"    Ad '{ad.get('name', ad['id'])}' error: {r['error']['message']}")
-            break
-        for lead in r.get("data", []):
-            try:
-                if datetime.fromisoformat(
+            page_leads, err = meta_paginate(
+                f"{BASE}/{ad['id']}/leads",
+                {
+                    "access_token": META_ACCESS_TOKEN,
+                    "fields": "id,created_time,field_data,platform,"
+                              "campaign_id,campaign_name,ad_name",
+                    "filtering": f'[{{"field":"time_created","operator":"GREATER_THAN",'
+                                 f'"value":{iso_to_unix(since_ts)}}}]',
+                    "limit": 100,
+                }
+            )
+            if err and "100" not in str(err):
+                continue
+            for lead in page_leads:
+                try:
+                    if datetime.fromisoformat(
                         lead["created_time"].replace("Z", "+00:00")) > until_dt:
-                    continue
-            except Exception:
-                pass
-            lead["_ad_name"]       = ad.get("name", "")
-            lead["_campaign_id"]   = ad.get("_campaign_id", "")
-            lead["_campaign_name"] = ad.get("_campaign_name", "")
-            lead["form_name"]      = ""
-            leads.append(lead)
-        url    = r.get("paging", {}).get("next")
-        params = None
-    return leads
+                        continue
+                except Exception:
+                    pass
+                lead["_form_name"]    = ""
+                lead["_campaign_id"]  = camp["id"]
+                lead["_campaign_name"]= camp["name"]
+                lead["_ad_name"]      = ad.get("name", "")
+                leads_by_id[lead["id"]] = lead
 
-def parse_lead_fields(lead):
-    """Convert Meta's field_data array into a clean dict."""
+    print(f"  [ads] {len(leads_by_id)} leads found via ads route")
+    return leads_by_id
+
+def parse_lead(lead):
+    """Convert Meta field_data array to clean dict."""
     raw = {}
     for f in lead.get("field_data", []):
-        values = f.get("values", [])
-        raw[f["name"]] = values[0] if values else ""
+        vals = f.get("values", [])
+        raw[f["name"]] = vals[0].strip() if vals else ""
 
     def g(*keys):
         for k in keys:
             v = raw.get(k, "").strip()
-            if v:
-                return v
+            if v: return v
         return ""
 
     return {
-        "lead_id":          lead.get("id", ""),
-        "lead_name":        g("full_name", "name", "first_name"),
-        "phone":            g("phone_number", "phone").replace("p:", ""),
-        "email":            g("email"),
-        "city":             g("city"),
-        "state":            g("additional_col1_select", "state", "province"),
-        "platform":         lead.get("platform", ""),
-        "investment_ready": g("additional_col6_select", "investment_readiness",
-                               "are_you_ready_to_invest", "ready_to_invest"),
-        "timeline":         g("additional_col3_select", "timeline",
+        "lead_id":           lead.get("id", ""),
+        "lead_name":         g("full_name", "name", "first_name"),
+        "phone":             g("phone_number", "phone").replace("p:", ""),
+        "email":             g("email"),
+        "city":              g("city"),
+        "state":             g("additional_col1_select", "state", "province"),
+        "platform":          lead.get("platform", ""),
+        "investment_ready":  g("additional_col6_select", "investment_readiness",
+                               "are_you_ready_to_invest"),
+        "timeline":          g("additional_col3_select", "timeline",
                                "when_are_you_planning_to_start"),
-        "earning_intent":   g("what_type_of_earning_opportunity_are_you_looking_for?",
+        "earning_intent":    g("what_type_of_earning_opportunity_are_you_looking_for?",
                                "earning_type", "opportunity_type"),
-        "campaign_id":      lead.get("campaign_id", ""),
-        "campaign_name":    lead.get("campaign_name", ""),
-        "ad_name":          lead.get("ad_name", ""),
-        "form_name":        lead.get("form_name", ""),
-        "lead_created_time": lead.get("created_time", ""),
+        "campaign_id":       lead.get("campaign_id","") or lead.get("_campaign_id",""),
+        "campaign_name":     lead.get("campaign_name","") or lead.get("_campaign_name",""),
+        "ad_name":           lead.get("ad_name","") or lead.get("_ad_name",""),
+        "form_name":         lead.get("_form_name",""),
+        "lead_created_time": lead.get("created_time",""),
     }
 
-# ── AI Scoring ────────────────────────────────────────────────────────────────
-INVESTMENT_SCORE = {
+# ── Scoring ───────────────────────────────────────────────────────────────────
+INVEST_SCORE = {
     "yes, i'm ready to invest":      40,
     "yes, i\u2019m ready to invest": 40,
     "i may need financing options":   20,
     "just exploring":                  5,
 }
-TIMELINE_SCORE = {
+TIME_SCORE = {
     "within 1\u20133 months": 35,
+    "within 1-3 months":      35,
     "within 3\u20136 months": 20,
+    "within 3-6 months":      20,
     "just exploring":           5,
 }
 INTENT_SCORE = {
@@ -265,46 +340,32 @@ INTENT_SCORE = {
     "just_exploring":                          2,
 }
 
-def precompute_signal_scores(lead):
-    inv_s = INVESTMENT_SCORE.get(lead["investment_ready"].lower(), 5)
-    tl_s  = TIMELINE_SCORE.get(lead["timeline"].lower(), 5)
-    ei_s  = INTENT_SCORE.get(lead["earning_intent"].lower(), 2)
-    return inv_s, tl_s, ei_s
+def rule_scores(lead):
+    inv = INVEST_SCORE.get(lead["investment_ready"].lower(), 5)
+    tl  = TIME_SCORE.get(lead["timeline"].lower(), 5)
+    ei  = INTENT_SCORE.get(lead["earning_intent"].lower(), 2)
+    return inv, tl, ei
 
-def get_ai_score(lead):
-    inv_s, tl_s, ei_s = precompute_signal_scores(lead)
-    rule_total = inv_s + tl_s + ei_s
+def groq_score(lead):
+    inv_s, tl_s, ei_s = rule_scores(lead)
+    baseline = inv_s + tl_s + ei_s
 
-    inv_label = {40:"Ready to invest",20:"Needs financing",5:"Just exploring"}.get(inv_s,"Unknown")
-    tl_label  = {35:"1-3 months",20:"3-6 months",5:"Just exploring"}.get(tl_s,"Unknown")
-    ei_label  = {25:"Wants franchise ownership",10:"Wants side income",2:"Just exploring"}.get(ei_s,"Unknown")
+    prompt = f"""You are a B2B franchise sales analyst for FABO (Indian laundry franchise).
+Score 0-100: likelihood this lead will open a FABO store.
 
-    prompt = f"""You are an expert B2B franchise sales analyst for FABO, an Indian laundry franchise brand.
-Your task: predict the probability (0-100) that this lead will actually open a FABO store.
+Name: {lead['lead_name'] or 'Unknown'} | City: {lead['city']}, {lead['state']} | Platform: {lead['platform']}
+Campaign: {lead['campaign_name']}
 
-LEAD PROFILE:
-Name: {lead['lead_name'] or 'Unknown'}
-City: {lead['city'] or 'Unknown'}, {lead['state'] or 'Unknown'}
-Platform: {lead['platform'] or 'Unknown'}
-Campaign: {lead['campaign_name'] or 'Unknown'}
+Form answers:
+- Investment: "{lead['investment_ready']}" [{inv_s}/40]
+- Timeline:   "{lead['timeline']}" [{tl_s}/35]
+- Intent:     "{lead['earning_intent']}" [{ei_s}/25]
+- Baseline:   {baseline}/100
 
-FORM RESPONSES:
-Investment readiness : "{lead['investment_ready']}" → {inv_label} [{inv_s}/40 pts]
-Decision timeline    : "{lead['timeline']}" → {tl_label} [{tl_s}/35 pts]
-Earning intent       : "{lead['earning_intent']}" → {ei_label} [{ei_s}/25 pts]
-Rule-based baseline  : {rule_total}/100
+Guide: Ready+1-3mo+franchise→85-100 | Ready+longer/side→70-84 | Financing+1-3mo+franchise→55-75
+       Financing+weak→40-60 | Exploring investment→20-45 | All exploring→5-20
 
-SCORING GUIDE:
-- Ready to invest + 1-3 months + franchise ownership → 85-100
-- Ready to invest + 3-6 months or side income intent → 70-84
-- Needs financing + 1-3 months + franchise ownership → 55-75
-- Needs financing + longer timeline or side income   → 40-60
-- Just exploring on investment OR weak intent        → 20-45
-- Just exploring on all three signals                → 5-20
-- Empty/missing fields reduce score by 5-10 pts
-
-Return ONLY a single integer 0-100. No text. No explanation.
-Score:"""
+Reply with ONE integer only (0-100):"""
 
     for attempt in range(3):
         try:
@@ -312,93 +373,92 @@ Score:"""
                 GROQ_URL,
                 headers={"Authorization": f"Bearer {GROQ_API_KEY}",
                          "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 5,
-                    "temperature": 0.0
-                },
+                json={"model": "llama-3.1-8b-instant",
+                      "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 5, "temperature": 0.0},
                 timeout=30
             )
             if r.status_code == 429:
                 wait = 2 * (attempt + 1)
-                print(f"  Rate limited — retrying in {wait}s...")
+                print(f"    Groq rate limit — waiting {wait}s")
                 time.sleep(wait)
                 continue
             if not r.ok:
-                print(f"  Groq {r.status_code}: {r.text[:120]}")
-                return rule_total
+                print(f"    Groq {r.status_code}: {r.text[:80]}")
+                return baseline, inv_s, tl_s, ei_s
             raw = r.json()["choices"][0]["message"]["content"].strip()
-            m = re.search(r"\b(\d{1,3})\b", raw)
-            if m:
-                return max(0, min(100, int(m.group(1))))
-            print(f"  Unexpected response: '{raw}' — using rule score {rule_total}")
-            return rule_total
+            m   = re.search(r"\b(\d{1,3})\b", raw)
+            score = max(0, min(100, int(m.group(1)))) if m else baseline
+            return score, inv_s, tl_s, ei_s
         except Exception as e:
-            print(f"  Groq error: {e}")
-            return rule_total
-    return rule_total
+            print(f"    Groq error: {e}")
+            return baseline, inv_s, tl_s, ei_s
+    return baseline, inv_s, tl_s, ei_s
 
-def grade_from_score(score):
-    if score >= 85: return "A"
-    if score >= 65: return "B"
-    if score >= 45: return "C"
-    if score >= 25: return "D"
-    return "F"
+def grade(score):
+    return ("A" if score >= 85 else "B" if score >= 65 else
+            "C" if score >= 45 else "D" if score >= 25 else "F")
 
-# ── Main pipeline ─────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    now_utc = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    print("=" * 56)
+    print(f"  Run started: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print("=" * 56)
 
-    print("=" * 55)
-    print(f"Run started : {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-    print("=" * 55)
-
-    print("\nSetting up BigQuery...")
+    print("\n[1] BigQuery setup")
     table_id = setup_bigquery()
 
-    since_ts = get_fetch_since_timestamp(table_id)
-    until_ts = now_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-    print(f"Fetch window : {since_ts}  →  {until_ts}")
+    print("\n[2] Validate Meta token")
+    if not validate_token():
+        raise SystemExit("Invalid token — aborting")
 
-    already_scored = get_already_scored_lead_ids(table_id)
+    since_ts = get_since_timestamp(table_id)
+    until_ts = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    print(f"  Window: {since_ts[:19]}  →  {until_ts[:19]}")
 
-    print("\nFetching lead gen ads from Meta (campaign -> ads -> leads)...")
-    ads = fetch_lead_gen_ads()
-    if not ads:
-        print("No lead gen ads found. Ensure campaigns use LEAD_GENERATION objective.")
-        return
+    already = get_already_scored_ids(table_id)
 
-    all_leads = []
-    for ad in ads:
-        raw_leads = fetch_leads_from_ad(ad, since_ts, until_ts)
-        parsed    = [parse_lead_fields(l) for l in raw_leads]
-        new       = [l for l in parsed if l["lead_id"] not in already_scored]
-        if raw_leads:
-            print(f"  Ad '{ad['name']}': {len(raw_leads)} fetched, {len(new)} new")
-        all_leads.extend(new)
+    print("\n[3] Fetch leads from Meta")
+    # Try forms route first (best data quality — includes form_name)
+    print("  Trying /leadgen_forms route...")
+    leads_by_id = fetch_via_forms(since_ts, until_ts)
 
-    print(f"\nNew leads to score : {len(all_leads)}")
+    # Supplement with ads route (catches anything the forms route missed)
+    print("  Supplementing with campaign→ads→leads route...")
+    ads_leads = fetch_via_ads(since_ts, until_ts)
+    before = len(leads_by_id)
+    for lid, lead in ads_leads.items():
+        if lid not in leads_by_id:
+            leads_by_id[lid] = lead
+    print(f"  Combined: {len(leads_by_id)} unique leads "
+          f"({len(leads_by_id)-before} added by ads route)")
+
+    # Parse and deduplicate against BigQuery
+    all_leads = [parse_lead(l) for l in leads_by_id.values()
+                 if l.get("id") not in already]
+    # Sort by created_time ascending so BQ gets chronological data
+    all_leads.sort(key=lambda x: x["lead_created_time"])
+
+    print(f"\n[4] Score {len(all_leads)} new leads")
     if not all_leads:
-        print("Nothing new to score — BigQuery is up to date.")
+        print("  Nothing new — BigQuery is already up to date.")
         return
 
-    print("\nScoring with Groq AI...")
     rows = []
     for i, lead in enumerate(all_leads, 1):
-        score = get_ai_score(lead)
-        grade = grade_from_score(score)
-        time.sleep(2.1)
+        score, inv_s, tl_s, ei_s = groq_score(lead)
+        g = grade(score)
+        time.sleep(2.1)   # Groq free tier: 30 RPM
 
         ts = lead["lead_created_time"]
         try:
             ts_clean = datetime.fromisoformat(
-                ts.replace("Z", "+00:00")
-            ).strftime("%Y-%m-%dT%H:%M:%S")
+                ts.replace("Z", "+00:00")).strftime("%Y-%m-%dT%H:%M:%S")
         except Exception:
-            ts_clean = now_utc.strftime("%Y-%m-%dT%H:%M:%S")
+            ts_clean = now.strftime("%Y-%m-%dT%H:%M:%S")
 
-        row = {
+        rows.append({
             "lead_id":           lead["lead_id"],
             "lead_name":         lead["lead_name"],
             "phone":             lead["phone"],
@@ -414,37 +474,50 @@ def main():
             "ad_name":           lead["ad_name"],
             "form_name":         lead["form_name"],
             "lead_created_time": ts_clean,
+            "inv_score":         inv_s,
+            "tl_score":          tl_s,
+            "et_score":          ei_s,
             "store_open_score":  float(score),
-            "grade":             grade,
-            "scored_at":         now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
-        }
-        rows.append(row)
-        print(f"[{i:3d}/{len(all_leads)}] {(lead['lead_name'] or 'Unknown'):25s} | "
-              f"{(lead['city'] or '?'):15s} | {score:3d} ({grade}) | "
-              f"{lead['investment_ready'][:28]}")
+            "grade":             g,
+            "scored_at":         now.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        print(f"  [{i:3d}/{len(all_leads)}] {(lead['lead_name'] or '?'):22s} | "
+              f"{(lead['city'] or '?'):13s} | {score:3d} {g} | "
+              f"{lead['investment_ready'][:25]}")
 
-    print(f"\nInserting {len(rows)} rows into BigQuery...")
-    errors = bq.insert_rows_json(table_id, rows)
-    if errors:
-        print(f"BigQuery errors: {errors}")
+    print(f"\n[5] Insert {len(rows)} rows into BigQuery...")
+    # FIX: insert in batches of 500 (BQ streaming limit)
+    batch_size = 500
+    total_errors = []
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start+batch_size]
+        errs  = bq.insert_rows_json(table_id, batch)
+        if errs:
+            total_errors.extend(errs)
+            print(f"  Batch {start//batch_size+1} errors: {errs[:2]}")
+        else:
+            print(f"  Batch {start//batch_size+1}: {len(batch)} rows inserted OK")
+
+    if total_errors:
+        print(f"\n  WARNING: {len(total_errors)} row(s) had insert errors")
     else:
-        print(f"Successfully loaded {len(rows)} lead scores → {table_id}")
+        print(f"  All {len(rows)} rows inserted successfully → {table_id}")
 
-    grades = {"A":0,"B":0,"C":0,"D":0,"F":0}
-    for r in rows:
-        grades[r["grade"]] += 1
+    # Summary
+    grade_counts = {"A":0,"B":0,"C":0,"D":0,"F":0}
+    for row in rows:
+        grade_counts[row["grade"]] += 1
 
-    print(f"\n{'─'*50}")
-    print(f"  Run date    : {now_utc.strftime('%Y-%m-%d')}")
-    print(f"  Window      : {since_ts[:10]} → {until_ts[:10]}")
-    print(f"  Total new   : {len(rows)}")
-    print(f"{'─'*50}")
-    print(f"  A Hot  (85-100) : {grades['A']:3d}  ← call immediately")
-    print(f"  B Warm (65-84)  : {grades['B']:3d}  ← follow up today")
-    print(f"  C Cool (45-64)  : {grades['C']:3d}  ← nurture sequence")
-    print(f"  D Cold (25-44)  : {grades['D']:3d}  ← low priority")
-    print(f"  F Dead (0-24)   : {grades['F']:3d}  ← skip")
-    print(f"{'─'*50}")
+    print(f"\n{'─'*54}")
+    print(f"  Date range : {since_ts[:10]}  →  {until_ts[:10]}")
+    print(f"  Total leads: {len(rows)}")
+    print(f"{'─'*54}")
+    print(f"  A Hot  85-100 : {grade_counts['A']:3d}  ← CALL IMMEDIATELY")
+    print(f"  B Warm 65-84  : {grade_counts['B']:3d}  ← Follow up today")
+    print(f"  C Cool 45-64  : {grade_counts['C']:3d}  ← Nurture sequence")
+    print(f"  D Cold 25-44  : {grade_counts['D']:3d}  ← Low priority")
+    print(f"  F Dead  0-24  : {grade_counts['F']:3d}  ← Skip")
+    print(f"{'─'*54}")
 
 if __name__ == "__main__":
     main()
