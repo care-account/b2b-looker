@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""
-FABO B2B Lead Scoring System
-Meta Ads → Groq AI → BigQuery
 
-FIXED VERSION:
-- Handles Meta rate limits
-- Handles Groq rate limits
-- Deduplicates leads
-- Incremental syncing
-- BigQuery insert logging
-- Retry handling
-- Safer batching
+"""
+FABO B2B Lead Scoring Pipeline
+Meta Ads -> Groq AI -> BigQuery
+
+PRODUCTION VERSION
+- Incremental sync
+- Meta rate-limit handling
+- Groq retry handling
+- Batch BigQuery inserts
+- Deduplication
+- Faster execution
+- GitHub Actions safe
 """
 
 import os
 import re
 import time
 import requests
-from datetime import datetime, timezone, timedelta
+
+from datetime import datetime, timedelta, timezone
 from google.cloud import bigquery
 
 # =============================================================================
@@ -25,39 +27,47 @@ from google.cloud import bigquery
 # =============================================================================
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-BIGQUERY_DATASET = os.getenv("BIGQUERY_DATASET", "meta_ads_b2b")
+
+BIGQUERY_DATASET = os.getenv(
+    "BIGQUERY_DATASET",
+    "meta_ads_b2b"
+)
 
 META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 
-_raw = os.getenv("META_AD_ACCOUNT_ID", "")
+_raw_account = os.getenv("META_AD_ACCOUNT_ID", "")
+
 META_AD_ACCOUNT_ID = (
-    f"act_{_raw}"
-    if _raw and not _raw.startswith("act_")
-    else _raw
+    f"act_{_raw_account}"
+    if _raw_account and not _raw_account.startswith("act_")
+    else _raw_account
 )
 
-GROQ_API_KEY = os.getenv("GROK_API_KEY") or os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = (
+    os.getenv("GROK_API_KEY")
+    or os.getenv("GROQ_API_KEY")
+)
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-LEADS_START_DATE = os.getenv("LEADS_START_DATE", "2025-01-01")
+SYNC_DAYS = int(os.getenv("SYNC_DAYS", "1"))
+
+BATCH_SIZE = 50
 
 # =============================================================================
 # VALIDATION
 # =============================================================================
 
-required_vars = {
+required = {
     "GCP_PROJECT_ID": GCP_PROJECT_ID,
     "META_ACCESS_TOKEN": META_ACCESS_TOKEN,
     "META_AD_ACCOUNT_ID": META_AD_ACCOUNT_ID,
     "GROQ_API_KEY": GROQ_API_KEY,
 }
 
-for k, v in required_vars.items():
+for k, v in required.items():
     if not v:
-        raise ValueError(f"{k} is required")
-
-print(f"Using Ad Account : {META_AD_ACCOUNT_ID}")
+        raise ValueError(f"{k} missing")
 
 # =============================================================================
 # BIGQUERY
@@ -75,8 +85,10 @@ def setup_bigquery():
         print(f"Dataset exists: {dataset_id}")
 
     except Exception:
+
         dataset = bigquery.Dataset(dataset_id)
         bq.create_dataset(dataset)
+
         print(f"Created dataset: {dataset_id}")
 
     table_id = f"{dataset_id}.lead_scores"
@@ -104,51 +116,125 @@ def setup_bigquery():
     ]
 
     try:
+
         bq.get_table(table_id)
+
         print(f"Table exists: {table_id}")
 
     except Exception:
-        table = bigquery.Table(table_id, schema=schema)
+
+        table = bigquery.Table(
+            table_id,
+            schema=schema
+        )
+
         bq.create_table(table)
+
         print(f"Created table: {table_id}")
 
     return table_id
 
 
 # =============================================================================
-# HELPERS
+# BIGQUERY HELPERS
 # =============================================================================
 
-def paginate(url, params):
+def get_existing_ids(table_id):
+
+    query = f"""
+    SELECT lead_id
+    FROM `{table_id}`
+    """
+
+    try:
+
+        rows = bq.query(query).result()
+
+        return {r.lead_id for r in rows}
+
+    except Exception as e:
+
+        print(f"Could not fetch existing IDs: {e}")
+
+        return set()
+
+
+def insert_batch(table_id, rows):
+
+    if not rows:
+        return
+
+    errors = bq.insert_rows_json(
+        table_id,
+        rows
+    )
+
+    if errors:
+
+        print("BigQuery insert errors:")
+        print(errors)
+
+    else:
+
+        print(f"Inserted {len(rows)} rows into BigQuery")
+
+
+# =============================================================================
+# META HELPERS
+# =============================================================================
+
+def paginate(url, params=None):
 
     results = []
 
     while url:
 
-        # Meta rate-limit protection
-        time.sleep(1)
+        try:
 
-        r = requests.get(url, params=params if params else {}).json()
+            # Meta protection
+            time.sleep(0.5)
 
-        if "error" in r:
+            r = requests.get(
+                url,
+                params=params if params else {},
+                timeout=60
+            )
 
-            code = r["error"].get("code")
+            data = r.json()
 
-            # Meta throttling
-            if code in [4, 17]:
+            if "error" in data:
 
-                print("Meta rate limit hit — sleeping 30s...")
-                time.sleep(30)
-                continue
+                error_code = data["error"].get("code")
 
-            print(f"Meta Error: {r['error']['message']}")
-            return results
+                # Meta throttling
+                if error_code in [4, 17]:
 
-        results.extend(r.get("data", []))
+                    print("Meta rate limit hit...")
+                    time.sleep(30)
 
-        url = r.get("paging", {}).get("next")
+                    continue
 
-        params = None
+                print(
+                    f"Meta error: "
+                    f"{data['error']['message']}"
+                )
+
+                break
+
+            results.extend(data.get("data", []))
+
+            url = data.get(
+                "paging",
+                {}
+            ).get("next")
+
+            params = None
+
+        except Exception as e:
+
+            print(f"Pagination error: {e}")
+
+            break
 
     return results
 
@@ -157,7 +243,7 @@ def paginate(url, params):
 # FETCH CAMPAIGNS
 # =============================================================================
 
-def fetch_lead_campaigns():
+def fetch_campaigns():
 
     base = "https://graph.facebook.com/v19.0"
 
@@ -170,20 +256,20 @@ def fetch_lead_campaigns():
         }
     )
 
-    LEAD_OBJECTIVES = {
+    objectives = {
         "LEAD_GENERATION",
         "OUTCOME_LEADS"
     }
 
-    lead_campaigns = [
+    filtered = [
         c for c in campaigns
-        if c.get("objective") in LEAD_OBJECTIVES
+        if c.get("objective") in objectives
         and c.get("status") == "ACTIVE"
     ]
 
-    print(f"Lead campaigns found: {len(lead_campaigns)}")
+    print(f"Lead campaigns found: {len(filtered)}")
 
-    return lead_campaigns
+    return filtered
 
 
 # =============================================================================
@@ -204,7 +290,7 @@ def fetch_ads(campaign):
     )
 
     for ad in ads:
-        ad["_campaign_id"] = campaign["id"]
+
         ad["_campaign_name"] = campaign["name"]
 
     return ads
@@ -217,6 +303,11 @@ def fetch_ads(campaign):
 def fetch_leads(ad):
 
     base = "https://graph.facebook.com/v19.0"
+
+    since = (
+        datetime.now(timezone.utc)
+        - timedelta(days=SYNC_DAYS)
+    )
 
     leads = paginate(
         f"{base}/{ad['id']}/leads",
@@ -231,19 +322,24 @@ def fetch_leads(ad):
                 "campaign_name,"
                 "ad_name"
             ),
-            "limit": 100
+            "limit": 100,
+            "filtering": f"""
+            [
+              {{
+                "field":"time_created",
+                "operator":"GREATER_THAN",
+                "value":{int(since.timestamp())}
+              }}
+            ]
+            """
         }
     )
-
-    for lead in leads:
-        lead["_campaign_id"] = ad["_campaign_id"]
-        lead["_campaign_name"] = ad["_campaign_name"]
 
     return leads
 
 
 # =============================================================================
-# PARSE LEADS
+# PARSE LEAD
 # =============================================================================
 
 def parse_lead(lead):
@@ -252,11 +348,14 @@ def parse_lead(lead):
 
     for field in lead.get("field_data", []):
 
-        vals = field.get("values", [])
+        values = field.get("values", [])
 
-        raw[field["name"]] = vals[0] if vals else ""
+        raw[field["name"]] = (
+            values[0]
+            if values else ""
+        )
 
-    def g(*keys):
+    def get_value(*keys):
 
         for k in keys:
 
@@ -269,33 +368,45 @@ def parse_lead(lead):
 
     return {
         "lead_id": lead.get("id", ""),
-        "lead_name": g("full_name", "name"),
-        "phone": g("phone_number", "phone"),
-        "email": g("email"),
-        "city": g("city"),
-        "state": g("state", "province"),
+        "lead_name": get_value(
+            "full_name",
+            "name"
+        ),
+        "phone": get_value(
+            "phone_number",
+            "phone"
+        ),
+        "email": get_value("email"),
+        "city": get_value("city"),
+        "state": get_value(
+            "state",
+            "province"
+        ),
         "platform": lead.get("platform", ""),
-        "investment_ready": g(
+        "investment_ready": get_value(
             "investment_readiness",
             "ready_to_invest"
         ),
-        "timeline": g(
+        "timeline": get_value(
             "timeline",
             "when_are_you_planning_to_start"
         ),
-        "earning_intent": g(
+        "earning_intent": get_value(
             "earning_type",
             "opportunity_type"
         ),
         "campaign_id": lead.get("campaign_id", ""),
         "campaign_name": lead.get("campaign_name", ""),
         "ad_name": lead.get("ad_name", ""),
-        "lead_created_time": lead.get("created_time", "")
+        "lead_created_time": lead.get(
+            "created_time",
+            ""
+        ),
     }
 
 
 # =============================================================================
-# SCORING RULES
+# RULE SCORING
 # =============================================================================
 
 INVESTMENT_SCORE = {
@@ -318,7 +429,7 @@ INTENT_SCORE = {
 }
 
 
-def get_rule_score(lead):
+def rule_score(lead):
 
     inv = INVESTMENT_SCORE.get(
         lead["investment_ready"].lower(),
@@ -339,21 +450,32 @@ def get_rule_score(lead):
 
 
 # =============================================================================
-# GROQ AI SCORING
+# GROQ AI SCORE
 # =============================================================================
 
-def get_ai_score(lead, rule_score):
+def ai_score(lead, base_score):
+
+    # Only AI-score good leads
+    if base_score < 40:
+        return base_score
 
     prompt = f"""
-You are an expert B2B franchise sales analyst.
+You are a B2B franchise sales expert.
 
-Predict probability (0-100) that this lead
-will open a franchise store.
+Predict probability (0-100)
+that this lead will become
+a serious franchise buyer.
 
 Lead:
-Name: {lead['lead_name']}
-City: {lead['city']}
-State: {lead['state']}
+
+Name:
+{lead['lead_name']}
+
+City:
+{lead['city']}
+
+State:
+{lead['state']}
 
 Investment Readiness:
 {lead['investment_ready']}
@@ -365,68 +487,77 @@ Earning Intent:
 {lead['earning_intent']}
 
 Rule Score:
-{rule_score}
+{base_score}
 
-Return ONLY integer score 0-100.
+Return ONLY integer.
 """
 
     for attempt in range(3):
 
         try:
 
-            response = requests.post(
+            r = requests.post(
                 GROQ_URL,
                 headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
+                    "Authorization":
+                    f"Bearer {GROQ_API_KEY}",
+
+                    "Content-Type":
+                    "application/json"
                 },
                 json={
-                    "model": "llama-3.1-8b-instant",
+                    "model":
+                    "llama-3.1-8b-instant",
+
                     "messages": [
                         {
                             "role": "user",
                             "content": prompt
                         }
                     ],
+
                     "temperature": 0,
                     "max_tokens": 5
                 },
-                timeout=30
+                timeout=60
             )
 
-            if response.status_code == 429:
+            if r.status_code == 429:
 
                 wait = 5 * (attempt + 1)
 
-                print(f"Groq rate limit — sleeping {wait}s")
+                print(
+                    f"Groq rate limit..."
+                    f"sleeping {wait}s"
+                )
 
                 time.sleep(wait)
 
                 continue
 
-            if not response.ok:
+            if not r.ok:
 
-                print(f"Groq error: {response.text}")
+                print(f"Groq error: {r.text}")
 
-                return rule_score
+                return base_score
 
-            raw = response.json()["choices"][0]["message"]["content"]
+            content = r.json()["choices"][0]["message"]["content"]
 
-            match = re.search(r"\d+", raw)
+            match = re.search(r"\d+", content)
 
             if match:
 
                 return int(match.group())
 
-            return rule_score
+            return base_score
 
         except Exception as e:
 
             print(f"Groq exception: {e}")
 
-            return rule_score
+            return base_score
 
-    return rule_score
+    return base_score
 
 
 # =============================================================================
@@ -451,28 +582,6 @@ def grade(score):
 
 
 # =============================================================================
-# DEDUPLICATION
-# =============================================================================
-
-def get_existing_ids(table_id):
-
-    query = f"""
-    SELECT lead_id
-    FROM `{table_id}`
-    """
-
-    try:
-
-        rows = bq.query(query).result()
-
-        return {r.lead_id for r in rows}
-
-    except Exception:
-
-        return set()
-
-
-# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -486,13 +595,13 @@ def main():
 
     existing_ids = get_existing_ids(table_id)
 
-    campaigns = fetch_lead_campaigns()
+    campaigns = fetch_campaigns()
 
-    all_rows = []
+    batch_rows = []
 
-    # DEBUG MODE
-    # Remove [:5] later
-    for campaign in campaigns[:5]:
+    total_processed = 0
+
+    for campaign in campaigns:
 
         print(f"\nCampaign: {campaign['name']}")
 
@@ -500,32 +609,28 @@ def main():
 
         print(f"Ads found: {len(ads)}")
 
-        # DEBUG MODE
-        for ad in ads[:10]:
+        for ad in ads:
 
-            print(f"Fetching leads from: {ad['name']}")
+            print(f"Fetching: {ad['name']}")
 
             leads = fetch_leads(ad)
 
             print(f"Leads fetched: {len(leads)}")
 
-            for raw_lead in leads:
+            for raw in leads:
 
-                lead = parse_lead(raw_lead)
+                lead = parse_lead(raw)
 
                 if lead["lead_id"] in existing_ids:
                     continue
 
-                rule_score = get_rule_score(lead)
+                base = rule_score(lead)
 
-                ai_score = get_ai_score(
-                    lead,
-                    rule_score
-                )
+                ai = ai_score(lead, base)
 
-                final_score = round(
-                    (rule_score * 0.6) +
-                    (ai_score * 0.4),
+                final = round(
+                    (base * 0.6) +
+                    (ai * 0.4),
                     2
                 )
 
@@ -543,48 +648,53 @@ def main():
                     "campaign_id": lead["campaign_id"],
                     "campaign_name": lead["campaign_name"],
                     "ad_name": lead["ad_name"],
-                    "lead_created_time": lead["lead_created_time"],
-                    "rule_score": float(rule_score),
-                    "ai_score": float(ai_score),
-                    "final_score": float(final_score),
-                    "grade": grade(final_score),
-                    "scored_at": datetime.utcnow().isoformat()
+                    "lead_created_time":
+                    lead["lead_created_time"],
+                    "rule_score": float(base),
+                    "ai_score": float(ai),
+                    "final_score": float(final),
+                    "grade": grade(final),
+                    "scored_at":
+                    datetime.utcnow().isoformat()
                 }
 
-                all_rows.append(row)
+                batch_rows.append(row)
+
+                total_processed += 1
 
                 print(
                     f"{lead['lead_name']} | "
-                    f"{final_score} | "
-                    f"{grade(final_score)}"
+                    f"{final} | "
+                    f"{grade(final)}"
                 )
 
+                # Batch insert
+                if len(batch_rows) >= BATCH_SIZE:
+
+                    insert_batch(
+                        table_id,
+                        batch_rows
+                    )
+
+                    batch_rows = []
+
                 # Groq protection
-                time.sleep(2)
+                time.sleep(0.3)
+
+    # Final insert
+    if batch_rows:
+
+        insert_batch(
+            table_id,
+            batch_rows
+        )
 
     print("\n")
     print("=" * 60)
-    print(f"TOTAL ROWS TO INSERT: {len(all_rows)}")
+    print("PIPELINE COMPLETE")
     print("=" * 60)
 
-    if not all_rows:
-        print("No rows to insert.")
-        return
-
-    errors = bq.insert_rows_json(
-        table_id,
-        all_rows
-    )
-
-    if errors:
-
-        print("\nBIGQUERY INSERT ERRORS:")
-        print(errors)
-
-    else:
-
-        print("\nSUCCESS!")
-        print(f"Inserted {len(all_rows)} rows into BigQuery")
+    print(f"Total leads processed: {total_processed}")
 
 
 # =============================================================================
