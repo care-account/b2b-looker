@@ -2,12 +2,11 @@ name: Meta Lead Store Opener Scoring
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # Daily 9 AM UTC (2:30 PM IST)
-
-  workflow_dispatch:        # Manual trigger with optional date override
+    - cron: '0 10 * * *'   # Daily 3:30 PM IST (10:00 UTC)
+  workflow_dispatch:
     inputs:
       start_date:
-        description: 'Override start date (YYYY-MM-DD). Leave blank to auto-detect from BigQuery.'
+        description: 'Override start date (YYYY-MM-DD). Leave blank for auto.'
         required: false
         default: ''
 
@@ -17,6 +16,7 @@ permissions:
 jobs:
   score-leads:
     runs-on: ubuntu-latest
+    timeout-minutes: 15        # ← HARD STOP at 15 min — never hangs again
     steps:
       - uses: actions/checkout@v4
 
@@ -38,13 +38,12 @@ jobs:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       - name: Score leads
+        timeout-minutes: 12    # ← script-level timeout (slightly under job timeout)
         env:
           GCP_PROJECT_ID:     ${{ secrets.GCP_PROJECT_ID }}
           BIGQUERY_DATASET:   ${{ secrets.BIGQUERY_DATASET }}
           META_ACCESS_TOKEN:  ${{ secrets.META_ACCESS_TOKEN }}
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
           GROK_API_KEY:       ${{ secrets.GROK_API_KEY }}
-          # LEADS_START_DATE: used only on first run (or when BigQuery empty)
-          # Manual override takes precedence; otherwise use secret; fallback to 2026-01-01
           LEADS_START_DATE: ${{ github.event.inputs.start_date || secrets.LEADS_START_DATE || '2026-01-01' }}
         run: python meta_lead_scoring.py
