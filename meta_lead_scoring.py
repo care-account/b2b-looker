@@ -128,68 +128,36 @@ def paginate(url, params):
         params = None
     return results, None
 
-def fetch_lead_gen_ads():
+def fetch_lead_forms():
     """
-    Route: ad_account -> LEAD_GENERATION campaigns -> ads
-    Works with ads_read only. No leadgen_forms / leads_retrieval needed.
+    Fetch all lead gen forms via the ad account.
+    Requires leads_retrieval permission.
+    ~1-5 API calls total regardless of number of ads.
     """
     base = "https://graph.facebook.com/v19.0"
-    campaigns, err = paginate(
-        f"{base}/{META_AD_ACCOUNT_ID}/campaigns",
+    forms, err = paginate(
+        f"{base}/{META_AD_ACCOUNT_ID}/leadgen_forms",
         {"access_token": META_ACCESS_TOKEN,
-         "fields": "id,name,objective,status", "limit": 100}
+         "fields": "id,name,status", "limit": 100}
     )
     if err:
-        print(f"[META] Campaign fetch error: {err}")
+        print(f"[META] Form fetch error: {err}")
         return []
+    active = [f for f in forms if f.get("status") != "ARCHIVED"]
+    print(f"  Lead forms total: {len(forms)}, active: {len(active)}")
+    return active
 
-    # Meta renamed the objective in 2022:
-    # Old campaigns: "LEAD_GENERATION"
-    # New campaigns: "OUTCOME_LEADS"
-    LEAD_OBJECTIVES = {"LEAD_GENERATION", "OUTCOME_LEADS"}
-    lead_camps = [c for c in campaigns if c.get("objective") in LEAD_OBJECTIVES]
-
-    # Print all unique objectives found for diagnostics
-    all_objectives = sorted(set(c.get("objective", "UNKNOWN") for c in campaigns))
-    print(f"  Campaigns total: {len(campaigns)}, lead gen: {len(lead_camps)}")
-    print(f"  Objectives found: {all_objectives}")
-
-    # Fallback: if no campaigns matched known lead objectives, try ALL campaigns
-    # (handles custom objectives or API changes)
-    if not lead_camps:
-        print("  No matching lead objectives — falling back to ALL campaigns to find lead ads")
-        lead_camps = campaigns
-
-    all_ads = []
-    for camp in lead_camps:
-        time.sleep(0.3)  # gentle throttle between campaigns
-        # Only fetch ACTIVE ads — paused/deleted ads can't have new leads
-        ads, err = paginate(
-            f"{base}/{camp['id']}/ads",
-            {"access_token": META_ACCESS_TOKEN,
-             "fields": "id,name,status,effective_status",
-             "filtering": '[{"field":"effective_status","operator":"IN","value":["ACTIVE","PAUSED"]}]',
-             "limit": 100}
-        )
-        if err:
-            print(f"  Campaign '{camp['name']}' ads error: {err}")
-            continue
-        for ad in ads:
-            ad["_campaign_id"]   = camp["id"]
-            ad["_campaign_name"] = camp["name"]
-        all_ads.extend(ads)
-
-    print(f"  Total lead gen ads: {len(all_ads)}")
-    return all_ads
-
-def fetch_leads_from_ad(ad, since_ts, until_ts):
-    """Fetch leads from a single ad. Works with ads_read permission."""
+def fetch_leads_from_form(form, since_ts, until_ts):
+    """
+    Fetch leads from a single form filtered by date.
+    1 API call per form (+ pagination if > 100 leads).
+    """
     base     = "https://graph.facebook.com/v19.0"
     until_dt = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
-    url      = f"{base}/{ad['id']}/leads"
+    url      = f"{base}/{form['id']}/leads"
     params   = {
         "access_token": META_ACCESS_TOKEN,
-        "fields": "id,created_time,field_data,platform,campaign_id,campaign_name,ad_name",
+        "fields": "id,created_time,field_data,platform,ad_id,ad_name,campaign_id,campaign_name",
         "filtering": f'[{{"field":"time_created","operator":"GREATER_THAN","value":{iso_to_unix(since_ts)}}}]',
         "limit": 100,
     }
@@ -197,8 +165,9 @@ def fetch_leads_from_ad(ad, since_ts, until_ts):
     while url:
         r = requests.get(url, params=params if params else {}).json()
         if "error" in r:
-            if r["error"].get("code") != 100:
-                print(f"    Ad '{ad.get('name', ad['id'])}' error: {r['error']['message']}")
+            code = r["error"].get("code", 0)
+            if code not in (100,):  # 100 = no leads, expected
+                print(f"  Form '{form.get('name', form['id'])}' error: {r['error']['message']}")
             break
         for lead in r.get("data", []):
             try:
@@ -207,10 +176,7 @@ def fetch_leads_from_ad(ad, since_ts, until_ts):
                     continue
             except Exception:
                 pass
-            lead["_ad_name"]       = ad.get("name", "")
-            lead["_campaign_id"]   = ad.get("_campaign_id", "")
-            lead["_campaign_name"] = ad.get("_campaign_name", "")
-            lead["form_name"]      = ""
+            lead["_form_name"] = form.get("name", "")
             leads.append(lead)
         url    = r.get("paging", {}).get("next")
         params = None
@@ -367,19 +333,19 @@ def main():
 
     already_scored = get_already_scored_lead_ids(table_id)
 
-    print("\nFetching lead gen ads from Meta (campaign -> ads -> leads)...")
-    ads = fetch_lead_gen_ads()
-    if not ads:
-        print("No lead gen ads found. Ensure campaigns use LEAD_GENERATION objective.")
+    print("\nFetching lead forms from Meta (requires leads_retrieval)...")
+    forms = fetch_lead_forms()
+    if not forms:
+        print("No lead forms found.")
         return
 
     all_leads = []
-    for ad in ads:
-        raw_leads = fetch_leads_from_ad(ad, since_ts, until_ts)
+    for form in forms:
+        raw_leads = fetch_leads_from_form(form, since_ts, until_ts)
         parsed    = [parse_lead_fields(l) for l in raw_leads]
         new       = [l for l in parsed if l["lead_id"] not in already_scored]
         if raw_leads:
-            print(f"  Ad '{ad['name']}': {len(raw_leads)} fetched, {len(new)} new")
+            print(f"  Form '{form['name']}': {len(raw_leads)} fetched, {len(new)} new")
         all_leads.extend(new)
 
     print(f"\nNew leads to score : {len(all_leads)}")
