@@ -162,10 +162,14 @@ def fetch_lead_gen_ads():
 
     all_ads = []
     for camp in lead_camps:
+        time.sleep(0.3)  # gentle throttle between campaigns
+        # Only fetch ACTIVE ads — paused/deleted ads can't have new leads
         ads, err = paginate(
             f"{base}/{camp['id']}/ads",
             {"access_token": META_ACCESS_TOKEN,
-             "fields": "id,name,status", "limit": 100}
+             "fields": "id,name,status,effective_status",
+             "filtering": '[{"field":"effective_status","operator":"IN","value":["ACTIVE","PAUSED"]}]',
+             "limit": 100}
         )
         if err:
             print(f"  Campaign '{camp['name']}' ads error: {err}")
