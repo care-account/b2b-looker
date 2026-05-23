@@ -134,7 +134,7 @@ def fetch_lead_forms():
     Requires leads_retrieval permission.
     ~1-5 API calls total regardless of number of ads.
     """
-    base = "https://graph.facebook.com/v19.0"
+    base = "https://graph.facebook.com/v21.0"
     forms, err = paginate(
         f"{base}/{META_AD_ACCOUNT_ID}/leadgen_forms",
         {"access_token": META_ACCESS_TOKEN,
@@ -152,7 +152,7 @@ def fetch_leads_from_form(form, since_ts, until_ts):
     Fetch leads from a single form filtered by date.
     1 API call per form (+ pagination if > 100 leads).
     """
-    base     = "https://graph.facebook.com/v19.0"
+    base     = "https://graph.facebook.com/v21.0"
     until_dt = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
     url      = f"{base}/{form['id']}/leads"
     params   = {
