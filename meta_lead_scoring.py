@@ -128,6 +128,63 @@ def paginate(url, params):
         params = None
     return results, None
 
+def check_token_permissions():
+    """
+    Diagnose token type and permissions before attempting lead form fetch.
+    Prints a clear report so failures are immediately actionable.
+    Returns True if leads_retrieval is confirmed, False otherwise.
+    """
+    base = "https://graph.facebook.com/v21.0"
+
+    # 1. Check token info (type, app, expiry)
+    r = requests.get(f"{base}/me", params={"access_token": META_ACCESS_TOKEN,
+                                            "fields": "id,name"}).json()
+    if "error" in r:
+        print(f"[META] Token is INVALID or EXPIRED: {r['error']['message']}")
+        print("       → Regenerate the META_ACCESS_TOKEN secret in GitHub.")
+        return False
+    print(f"  Token identity   : {r.get('name', '?')} (id={r.get('id', '?')})")
+
+    # 2. Check permissions
+    rp = requests.get(f"{base}/me/permissions",
+                      params={"access_token": META_ACCESS_TOKEN}).json()
+    if "error" in rp:
+        print(f"[META] Cannot read permissions: {rp['error']['message']}")
+        return False
+
+    granted = {p["permission"] for p in rp.get("data", [])
+               if p.get("status") == "granted"}
+    has_leads = "leads_retrieval" in granted
+    print(f"  leads_retrieval  : {'✓ GRANTED' if has_leads else '✗ MISSING  ← THIS IS THE BUG'}")
+    if not has_leads:
+        print()
+        print("  HOW TO FIX:")
+        print("  If using a System User token (recommended for CI):")
+        print("    Business Manager → Settings → Users → System Users")
+        print("    → Select user → Add Assets → your Ad Account (Manage role)")
+        print("    → Generate New Token → check 'leads_retrieval' scope")
+        print("  If using a personal User token:")
+        print("    Regenerate via Graph API Explorer with leads_retrieval permission,")
+        print("    then update the META_ACCESS_TOKEN secret in GitHub Actions.")
+        print()
+
+    # 3. Check ad account access
+    ra = requests.get(f"{base}/{META_AD_ACCOUNT_ID}",
+                      params={"access_token": META_ACCESS_TOKEN,
+                              "fields": "id,name,account_status"}).json()
+    if "error" in ra:
+        print(f"  ad account access: ✗ {ra['error']['message']}")
+        print("       → Ensure the token's user has access to this ad account.")
+    else:
+        status_map = {1: "ACTIVE", 2: "DISABLED", 3: "UNSETTLED", 7: "PENDING_RISK_REVIEW",
+                      9: "IN_GRACE_PERIOD", 100: "PENDING_CLOSURE", 101: "CLOSED",
+                      201: "ANY_ACTIVE", 202: "ANY_CLOSED"}
+        acct_status = ra.get("account_status", "?")
+        print(f"  ad account       : {ra.get('name', '?')} — {status_map.get(acct_status, acct_status)}")
+
+    return has_leads
+
+
 def fetch_lead_forms():
     """
     Fetch all lead gen forms via the ad account.
@@ -135,6 +192,13 @@ def fetch_lead_forms():
     ~1-5 API calls total regardless of number of ads.
     """
     base = "https://graph.facebook.com/v21.0"
+
+    print("  Running token diagnostics...")
+    ok = check_token_permissions()
+    if not ok:
+        print("[META] Aborting form fetch — fix token permissions first (see above).")
+        return []
+
     forms, err = paginate(
         f"{base}/{META_AD_ACCOUNT_ID}/leadgen_forms",
         {"access_token": META_ACCESS_TOKEN,
