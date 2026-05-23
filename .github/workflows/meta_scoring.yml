@@ -16,7 +16,7 @@ permissions:
 jobs:
   score-leads:
     runs-on: ubuntu-latest
-    timeout-minutes: 15        # ← HARD STOP at 15 min — never hangs again
+    timeout-minutes: 35        # ← HARD STOP at 15 min — never hangs again
     steps:
       - uses: actions/checkout@v4
 
@@ -38,7 +38,7 @@ jobs:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       - name: Score leads
-        timeout-minutes: 12    # ← script-level timeout (slightly under job timeout)
+        timeout-minutes: 30    # ← script-level timeout (slightly under job timeout)
         env:
           GCP_PROJECT_ID:     ${{ secrets.GCP_PROJECT_ID }}
           BIGQUERY_DATASET:   ${{ secrets.BIGQUERY_DATASET }}
