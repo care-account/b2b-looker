@@ -170,12 +170,11 @@ def fetch_active_lead_ads():
     all_ads = []
     for camp in lead_camps:
         time.sleep(0.3)
-        # Only ACTIVE or PAUSED ads — deleted/archived ads never get new leads
+        # Fetch ALL ads regardless of status — inactive campaigns still hold historical leads
         ads, err = meta_paginate(
             f"{base}/{camp['id']}/ads",
             {"access_token": META_ACCESS_TOKEN,
              "fields": "id,name,effective_status",
-             "filtering": '[{"field":"effective_status","operator":"IN","value":["ACTIVE","PAUSED"]}]',
              "limit": 100}
         )
         if err:
@@ -186,7 +185,7 @@ def fetch_active_lead_ads():
             ad["_campaign_name"] = camp["name"]
         all_ads.extend(ads)
 
-    print(f"  Active/paused lead ads: {len(all_ads)}")
+    print(f"  Total lead ads (all statuses): {len(all_ads)}")
     return all_ads
 
 def fetch_leads_from_ad(ad, since_ts, until_ts):
