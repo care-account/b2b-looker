@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: 'Override start date YYYY-MM-DD (blank = auto from BigQuery, max 7 days back)'
+        description: 'Override start date YYYY-MM-DD (blank = auto from BigQuery)'
         required: false
         default: ''
 
@@ -16,8 +16,7 @@ permissions:
 jobs:
   score-leads:
     runs-on: ubuntu-latest
-    timeout-minutes: 30      # Account-level fetch is fast — 30 min is generous
-
+    timeout-minutes: 360      # 6 hours — enough for 10,000+ leads on first run
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +44,5 @@ jobs:
           META_ACCESS_TOKEN:  ${{ secrets.META_ACCESS_TOKEN }}
           META_AD_ACCOUNT_ID: ${{ secrets.META_AD_ACCOUNT_ID }}
           GROK_API_KEY:       ${{ secrets.GROK_API_KEY }}
-          # Only used if manually triggered with an override date
-          LEADS_START_DATE:   ${{ github.event.inputs.start_date }}
+          LEADS_START_DATE: ${{ github.event.inputs.start_date || secrets.LEADS_START_DATE || '2023-01-01' }}
         run: python meta_lead_scoring.py
