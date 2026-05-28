@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 FABO B2B Lead Scorer — Store Opener Prediction
-Strategy: fetch ALL leads from the ad account in one paginated call filtered
-by time window (max 7 days), then score in parallel with Groq.
 
-Why this is fast:
-  - OLD: 1,127 ads × 1 API call each = ~1,127 requests + 338 s forced sleep
-  - NEW: 1 account-level /leads call paginated → all leads in ~5–20 requests
-  - Groq scoring: parallel threads instead of sequential
+Speed strategy:
+  - Fetch ad list once (campaigns → ads, all statuses)
+  - Fetch leads from all ads IN PARALLEL (20 threads) with 7-day time filter
+  - Skip ads that returned 0 leads (no sleep wasted)
+  - Score new leads IN PARALLEL (8 Groq threads)
+
+Expected runtime: ~2–4 min for 1,100+ ads with 0–50 new leads/day
 """
 
 import os, re, time, requests
@@ -22,8 +23,9 @@ META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN")
 GROQ_API_KEY      = os.getenv("GROK_API_KEY") or os.getenv("GROQ_API_KEY")
 GROQ_URL          = "https://api.groq.com/openai/v1/chat/completions"
 
-MAX_WINDOW_DAYS   = 7   # Never scan more than 7 days back on any run
-GROQ_WORKERS      = 8   # Parallel threads for Groq scoring
+MAX_WINDOW_DAYS   = 7    # Never look back more than 7 days
+META_FETCH_WORKERS = 20  # Parallel threads for fetching leads from ads
+GROQ_WORKERS      = 8    # Parallel threads for Groq AI scoring
 GRAPH_VERSION     = "v19.0"
 BASE              = f"https://graph.facebook.com/{GRAPH_VERSION}"
 
@@ -87,7 +89,6 @@ def setup_bigquery():
     return table_id
 
 def get_already_scored_ids(table_id):
-    """Return set of lead_ids already in BigQuery — used to skip duplicates."""
     get_bq()
     try:
         ids = {row.lead_id for row in bq.query(f"SELECT lead_id FROM `{table_id}`").result()}
@@ -98,11 +99,7 @@ def get_already_scored_ids(table_id):
         return set()
 
 def get_window(table_id):
-    """
-    Return (since_ts, until_ts) strings for this run.
-    since = MAX(lead_created_time) + 1s, but never more than MAX_WINDOW_DAYS ago.
-    until = now UTC.
-    """
+    """Return (since_ts, until_ts), since capped at MAX_WINDOW_DAYS ago."""
     get_bq()
     now        = datetime.now(timezone.utc)
     hard_floor = now - timedelta(days=MAX_WINDOW_DAYS)
@@ -116,7 +113,7 @@ def get_window(table_id):
                 latest = latest.replace(tzinfo=timezone.utc)
             since = latest + timedelta(seconds=1)
             if since < hard_floor:
-                print(f"Last BQ record was {latest.date()} — capping window to {MAX_WINDOW_DAYS} days")
+                print(f"Last BQ record {latest.date()} — capping window to {MAX_WINDOW_DAYS} days")
                 since = hard_floor
             else:
                 print(f"Incremental: fetching leads after {since.strftime('%Y-%m-%dT%H:%M:%S+00:00')}")
@@ -128,116 +125,199 @@ def get_window(table_id):
     print(f"No prior data — using {MAX_WINDOW_DAYS}-day window from {since.date()}")
     return since.strftime("%Y-%m-%dT%H:%M:%S+00:00"), until_ts
 
-# ── Meta API ──────────────────────────────────────────────────────────────────
+# ── Meta API helpers ──────────────────────────────────────────────────────────
 def iso_to_unix(s):
     return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
 
-def meta_get(url, params, retries=4):
-    """Single Meta Graph API GET with rate-limit retry. Returns (data_list, error)."""
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, params=params, timeout=30).json()
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
-                continue
-            return [], str(e)
-        if "error" in r:
-            msg  = r["error"]["message"]
-            code = r["error"].get("code", 0)
-            if code in (17, 80004) or "too many calls" in msg.lower():
-                wait = 20 * (attempt + 1)
-                print(f"  [RATE LIMIT] waiting {wait}s (attempt {attempt+1}/{retries})...")
-                time.sleep(wait)
-                continue
-            return [], msg
-        return r.get("data", []), r.get("paging", {}).get("next"), None
-    return [], None, "Rate limit: retries exhausted"
+def meta_paginate_serial(url, params):
+    """Paginate a single Meta endpoint serially. Returns (results, error)."""
+    results = []
+    while url:
+        for attempt in range(4):
+            try:
+                r = requests.get(url, params=params if params else {}, timeout=30).json()
+            except Exception as e:
+                if attempt < 3:
+                    time.sleep(5)
+                    continue
+                return results, str(e)
+            if "error" in r:
+                msg  = r["error"]["message"]
+                code = r["error"].get("code", 0)
+                if code in (17, 80004) or "too many calls" in msg.lower():
+                    wait = 20 * (attempt + 1)
+                    print(f"  [RATE LIMIT] waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+                return results, msg
+            break
+        else:
+            return results, "Rate limit exhausted"
+        results.extend(r.get("data", []))
+        url    = r.get("paging", {}).get("next")
+        params = None
+    return results, None
 
 def validate_token():
-    r = requests.get(f"{BASE}/me", params={"access_token": META_ACCESS_TOKEN}, timeout=15).json()
+    r = requests.get(f"{BASE}/me",
+                     params={"access_token": META_ACCESS_TOKEN}, timeout=15).json()
     if "error" in r:
         print(f"[META] Token invalid: {r['error']['message']}")
         return False
     print(f"[META] Token OK — {r.get('name', r.get('id'))}")
     return True
 
-def fetch_all_leads_for_account(since_ts, until_ts, already_scored):
+# ── Ad discovery ──────────────────────────────────────────────────────────────
+def fetch_all_lead_ads():
     """
-    Fetch ALL new leads for the ad account in a single paginated stream,
-    filtered server-side by time_created > since_ts.
-
-    This replaces the old 1,127-ad loop:
-      - 1 endpoint: /{ad_account}/leads
-      - Server-side time filter (GREATER_THAN unix timestamp)
-      - Paginated — typically 5–30 pages for a 7-day window
-      - No per-ad sleep needed
+    Fetch ALL lead-gen ads (all statuses) across all campaigns.
+    Returns list of ad dicts with _campaign_id / _campaign_name attached.
     """
-    since_unix = iso_to_unix(since_ts)
-    until_dt   = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
+    campaigns, err = meta_paginate_serial(
+        f"{BASE}/{META_AD_ACCOUNT_ID}/campaigns",
+        {"access_token": META_ACCESS_TOKEN,
+         "fields": "id,name,objective,effective_status",
+         "limit": 100}
+    )
+    if err:
+        print(f"[META] Campaign fetch error: {err}")
+        return []
 
-    url    = f"{BASE}/{META_AD_ACCOUNT_ID}/leads"
+    LEAD_OBJ   = {"LEAD_GENERATION", "OUTCOME_LEADS"}
+    lead_camps = [c for c in campaigns if c.get("objective") in LEAD_OBJ]
+    all_obj    = sorted({c.get("objective", "?") for c in campaigns})
+    print(f"  Campaigns: {len(campaigns)} total, {len(lead_camps)} lead gen")
+    print(f"  Objectives: {all_obj}")
+
+    if not lead_camps:
+        return []
+
+    all_ads = []
+    for camp in lead_camps:
+        ads, err = meta_paginate_serial(
+            f"{BASE}/{camp['id']}/ads",
+            {"access_token": META_ACCESS_TOKEN,
+             "fields": "id,name,effective_status",
+             "limit": 100}
+        )
+        if err:
+            print(f"  Campaign '{camp['name']}' ads error: {err}")
+            continue
+        for ad in ads:
+            ad["_campaign_id"]   = camp["id"]
+            ad["_campaign_name"] = camp["name"]
+        all_ads.extend(ads)
+
+    active   = sum(1 for a in all_ads if a.get("effective_status") == "ACTIVE")
+    inactive = len(all_ads) - active
+    print(f"  Total ads: {len(all_ads)} ({active} active, {inactive} inactive/paused)")
+    return all_ads
+
+# ── Parallel lead fetching ────────────────────────────────────────────────────
+def fetch_leads_for_one_ad(ad, since_unix, until_dt, already_scored):
+    """
+    Fetch leads from a single ad filtered by time. Designed to run in a thread.
+    Returns list of raw lead dicts (new only, not in already_scored).
+    """
+    url    = f"{BASE}/{ad['id']}/leads"
     params = {
         "access_token": META_ACCESS_TOKEN,
-        "fields": "id,created_time,field_data,platform,ad_id,ad_name,campaign_id,campaign_name",
+        "fields": "id,created_time,field_data,platform,ad_name,campaign_id,campaign_name",
         "filtering": f'[{{"field":"time_created","operator":"GREATER_THAN","value":{since_unix}}}]',
-        "limit": 200,   # max page size — fewer round-trips
+        "limit": 100,
     }
-
-    all_leads  = []
-    page_count = 0
-    skipped    = 0
-
-    print(f"  Fetching from account endpoint (since={since_ts[:10]}, until={until_ts[:10]})...")
-
+    leads = []
     while url:
-        page_count += 1
-        r = requests.get(url, params=params if params else {}, timeout=30)
-        if not r.ok:
-            print(f"  [HTTP {r.status_code}] {r.text[:200]}")
+        for attempt in range(3):
+            try:
+                r = requests.get(url, params=params if params else {}, timeout=30).json()
+            except Exception:
+                if attempt < 2:
+                    time.sleep(3)
+                    continue
+                return leads
+            if "error" in r:
+                code = r["error"].get("code", 0)
+                msg  = r["error"]["message"]
+                if code in (17, 80004) or "too many calls" in msg.lower():
+                    time.sleep(15 * (attempt + 1))
+                    continue
+                # code 100 = no leads on this ad — expected, not an error
+                return leads
             break
-        data = r.json()
+        else:
+            return leads
 
-        if "error" in data:
-            msg  = data["error"]["message"]
-            code = data["error"].get("code", 0)
-            if code in (17, 80004) or "too many calls" in msg.lower():
-                print(f"  [RATE LIMIT] page {page_count} — waiting 30s...")
-                time.sleep(30)
-                continue  # retry same URL
-            print(f"  [API ERROR] {msg}")
-            break
-
-        for lead in data.get("data", []):
-            # Client-side until_ts guard (server filter is only GREATER_THAN)
+        for lead in r.get("data", []):
+            # Client-side upper bound guard
             try:
                 created = datetime.fromisoformat(lead["created_time"].replace("Z", "+00:00"))
                 if created > until_dt:
-                    skipped += 1
                     continue
             except Exception:
                 pass
-            # Skip if already in BigQuery
             if lead.get("id") in already_scored:
-                skipped += 1
                 continue
-            all_leads.append(lead)
+            lead["_ad_name"]       = ad.get("name", "")
+            lead["_campaign_id"]   = ad.get("_campaign_id", "")
+            lead["_campaign_name"] = ad.get("_campaign_name", "")
+            leads.append(lead)
 
-        next_url = data.get("paging", {}).get("next")
-        url      = next_url
-        params   = None  # next URL has params baked in
+        url    = r.get("paging", {}).get("next")
+        params = None
+    return leads
 
-        if page_count % 5 == 0:
-            print(f"  ... page {page_count}, {len(all_leads)} new leads so far")
+def fetch_all_leads_parallel(ads, since_ts, until_ts, already_scored):
+    """
+    Fetch leads from all ads using a thread pool.
+    1,127 ads with 20 workers ≈ 57 rounds × ~0.5s = ~30s total vs 18 min serial.
 
-        # Tiny pause only every 10 pages to avoid burst rate limits
-        if page_count % 10 == 0:
-            time.sleep(1)
+    Dedup note: already_scored covers leads from previous runs.
+    seen_this_run deduplicates within this run (same lead_id on 2 ads).
+    Both sets are read-only inside threads; seen_this_run is updated only
+    in the main thread as futures complete, so no lock needed.
+    """
+    since_unix    = iso_to_unix(since_ts)
+    until_dt      = datetime.fromisoformat(until_ts.replace("Z", "+00:00"))
+    seen_this_run = set()  # tracks lead_ids collected so far this run
 
-    print(f"  Done: {page_count} pages, {len(all_leads)} new leads ({skipped} skipped/duplicate)")
+    all_leads      = []
+    ads_with_leads = 0
+    done           = 0
+    total          = len(ads)
+
+    print(f"  Fetching from {total} ads in parallel ({META_FETCH_WORKERS} workers)...")
+
+    with ThreadPoolExecutor(max_workers=META_FETCH_WORKERS) as pool:
+        future_to_ad = {
+            pool.submit(fetch_leads_for_one_ad, ad, since_unix, until_dt, already_scored): ad
+            for ad in ads
+        }
+        for fut in as_completed(future_to_ad):
+            done += 1
+            try:
+                leads = fut.result()
+                # Deduplicate within this run (main thread only — no lock needed)
+                new_leads = [l for l in leads if l.get("id") not in seen_this_run]
+                for l in new_leads:
+                    seen_this_run.add(l.get("id"))
+                if new_leads:
+                    ads_with_leads += 1
+                    all_leads.extend(new_leads)
+                    ad = future_to_ad[fut]
+                    print(f"    ✓ '{ad.get('name','?')}' — {len(new_leads)} new leads  "
+                          f"[{done}/{total}]")
+            except Exception as e:
+                print(f"    [FETCH ERROR] {e}")
+
+            if done % 100 == 0:
+                print(f"  ... {done}/{total} ads checked, {len(all_leads)} new leads so far")
+
+    print(f"  Done: {total} ads checked, {ads_with_leads} had new leads, "
+          f"{len(all_leads)} total new leads")
     return all_leads
 
-# ── Lead Parsing ──────────────────────────────────────────────────────────────
+# ── Lead parsing ──────────────────────────────────────────────────────────────
 def parse_lead(lead):
     raw = {f["name"]: (f["values"][0] if f.get("values") else "")
            for f in lead.get("field_data", [])}
@@ -254,21 +334,25 @@ def parse_lead(lead):
         "city":              g("city"),
         "state":             g("additional_col1_select", "state", "province"),
         "platform":          lead.get("platform", ""),
-        "investment_ready":  g("additional_col6_select", "investment_readiness", "are_you_ready_to_invest"),
-        "timeline":          g("additional_col3_select", "timeline", "when_are_you_planning_to_start"),
-        "earning_intent":    g("what_type_of_earning_opportunity_are_you_looking_for?", "earning_type"),
-        "campaign_id":       lead.get("campaign_id", ""),
-        "campaign_name":     lead.get("campaign_name", ""),
-        "ad_name":           lead.get("ad_name", ""),
+        "investment_ready":  g("additional_col6_select", "investment_readiness",
+                               "are_you_ready_to_invest"),
+        "timeline":          g("additional_col3_select", "timeline",
+                               "when_are_you_planning_to_start"),
+        "earning_intent":    g("what_type_of_earning_opportunity_are_you_looking_for?",
+                               "earning_type"),
+        "campaign_id":       lead.get("_campaign_id", "") or lead.get("campaign_id", ""),
+        "campaign_name":     lead.get("_campaign_name", "") or lead.get("campaign_name", ""),
+        "ad_name":           lead.get("_ad_name", "") or lead.get("ad_name", ""),
         "form_name":         "",
         "lead_created_time": lead.get("created_time", ""),
     }
 
-# ── AI Scoring ────────────────────────────────────────────────────────────────
+# ── AI scoring ────────────────────────────────────────────────────────────────
 INV_SCORE = {"yes, i'm ready to invest": 40, "yes, i\u2019m ready to invest": 40,
              "i may need financing options": 20, "just exploring": 5}
 TL_SCORE  = {"within 1\u20133 months": 35, "within 3\u20136 months": 20, "just exploring": 5}
-ET_SCORE  = {"high_commission_per_successful_closure": 25, "side_income": 10, "just_exploring": 2}
+ET_SCORE  = {"high_commission_per_successful_closure": 25, "side_income": 10,
+             "just_exploring": 2}
 
 def get_ai_score(lead):
     inv_s = INV_SCORE.get(lead["investment_ready"].lower(), 5)
@@ -309,16 +393,19 @@ def get_ai_score(lead):
                 continue
             if not r.ok:
                 return base
-            raw = r.json()["choices"][0]["message"]["content"].strip()
-            m   = re.search(r"\b(\d{1,3})\b", raw)
+            text = r.json()["choices"][0]["message"]["content"].strip()
+            m    = re.search(r"\b(\d{1,3})\b", text)
             return max(0, min(100, int(m.group(1)))) if m else base
         except Exception:
             return base
     return base
 
-def score_lead(args):
-    """Worker function for ThreadPoolExecutor."""
-    i, total, lead, now = args
+def grade(s):
+    return "A" if s >= 85 else "B" if s >= 65 else "C" if s >= 45 else "D" if s >= 25 else "F"
+
+def score_lead_worker(args):
+    """Worker for parallel Groq scoring."""
+    i, lead, now = args
     score    = get_ai_score(lead)
     g        = grade(score)
     ts       = lead["lead_created_time"]
@@ -347,9 +434,6 @@ def score_lead(args):
         "scored_at":         now.strftime("%Y-%m-%dT%H:%M:%S"),
     }
 
-def grade(s):
-    return "A" if s >= 85 else "B" if s >= 65 else "C" if s >= 45 else "D" if s >= 25 else "F"
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     now = datetime.now(timezone.utc)
@@ -367,78 +451,81 @@ def main():
     since_ts, until_ts = get_window(table_id)
     print(f"Window: {since_ts[:10]} → {until_ts[:10]} (max {MAX_WINDOW_DAYS} days)")
 
-    # Load existing IDs once — used for dedup inside the fetch loop
     already = get_already_scored_ids(table_id)
 
-    # ── Fetch leads (single account-level call, not per-ad) ──────────────────
-    print("\nFetching leads from account endpoint...")
-    t0         = time.time()
-    raw_leads  = fetch_all_leads_for_account(since_ts, until_ts, already)
-    fetch_secs = time.time() - t0
-    print(f"  Fetch completed in {fetch_secs:.1f}s")
-
-    parsed_leads = [parse_lead(l) for l in raw_leads]
-
-    print(f"\nNew leads to score: {len(parsed_leads)}")
-    if not parsed_leads:
-        print("Nothing new — BigQuery is up to date.")
+    # ── 1. Discover all lead-gen ads ─────────────────────────────────────────
+    print("\nFetching lead gen ads...")
+    t0  = time.time()
+    ads = fetch_all_lead_ads()
+    if not ads:
+        print("No lead gen ads found.")
         return
 
-    # ── Score in parallel ─────────────────────────────────────────────────────
-    print(f"\nScoring {len(parsed_leads)} leads with Groq ({GROQ_WORKERS} parallel workers)...")
+    # ── 2. Fetch leads from all ads in parallel ───────────────────────────────
+    print(f"\nFetching leads ({META_FETCH_WORKERS} parallel workers)...")
+    raw_leads  = fetch_all_leads_parallel(ads, since_ts, until_ts, already)
+    fetch_secs = time.time() - t0
+    print(f"  Ad discovery + lead fetch: {fetch_secs:.1f}s")
+
+    parsed = [parse_lead(l) for l in raw_leads]
+
+    print(f"\nNew leads to score: {len(parsed)}")
+    if not parsed:
+        print(f"Nothing new — BigQuery is up to date. Total time: {time.time()-t0:.0f}s")
+        return
+
+    # ── 3. Score in parallel ──────────────────────────────────────────────────
+    print(f"\nScoring {len(parsed)} leads with Groq ({GROQ_WORKERS} workers)...")
     t1   = time.time()
-    rows = [None] * len(parsed_leads)
-    args = [(i + 1, len(parsed_leads), lead, now) for i, lead in enumerate(parsed_leads)]
+    rows = [None] * len(parsed)
 
     with ThreadPoolExecutor(max_workers=GROQ_WORKERS) as pool:
-        futures = {pool.submit(score_lead, a): a[0] for a in args}
+        futures = {pool.submit(score_lead_worker, (i + 1, lead, now)): i
+                   for i, lead in enumerate(parsed)}
         for fut in as_completed(futures):
             try:
                 i, row = fut.result()
                 rows[i - 1] = row
-                g = row["grade"]
                 s = int(row["store_open_score"])
-                print(f"  [{i:3d}/{len(parsed_leads)}] "
+                print(f"  [{i:3d}/{len(parsed)}] "
                       f"{(row['lead_name'] or '?'):25s} | "
                       f"{(row['city'] or '?'):15s} | "
-                      f"{s:3d} ({g}) | "
-                      f"{row['investment_ready'][:28]}")
+                      f"{s:3d} ({row['grade']}) | "
+                      f"{row['investment_ready'][:30]}")
             except Exception as e:
                 print(f"  [SCORE ERROR] {e}")
 
     score_secs = time.time() - t1
-    print(f"  Scoring completed in {score_secs:.1f}s")
-
-    # Filter out any None rows (shouldn't happen, but be safe)
     rows = [r for r in rows if r is not None]
 
-    # ── Save to BigQuery in batches ───────────────────────────────────────────
+    # ── 4. Save to BigQuery ───────────────────────────────────────────────────
     BATCH = 200
     saved = 0
     for start in range(0, len(rows), BATCH):
         batch = rows[start:start + BATCH]
         errs  = bq.insert_rows_json(table_id, batch)
         if errs:
-            print(f"  [BQ] Batch {start}–{start+len(batch)} error: {errs[:2]}")
+            print(f"  [BQ] Batch error: {errs[:2]}")
         else:
             saved += len(batch)
             print(f"  [BQ] ✓ Saved rows {start+1}–{start+len(batch)}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
-    grade_counts = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
+    gc = {"A": 0, "B": 0, "C": 0, "D": 0, "F": 0}
     for r in rows:
-        grade_counts[r["grade"]] += 1
+        gc[r["grade"]] += 1
 
     total_secs = time.time() - t0
     print(f"\n{'─'*50}")
-    print(f"  Window   : {since_ts[:10]} → {until_ts[:10]}")
-    print(f"  Saved    : {saved} leads  |  Total time: {total_secs:.0f}s")
+    print(f"  Window     : {since_ts[:10]} → {until_ts[:10]}")
+    print(f"  Fetch      : {fetch_secs:.0f}s  |  Score: {score_secs:.0f}s  |  Total: {total_secs:.0f}s")
+    print(f"  Saved      : {saved} leads")
     print(f"{'─'*50}")
-    print(f"  A Hot  (85-100) : {grade_counts['A']:3d}  ← call immediately")
-    print(f"  B Warm (65-84)  : {grade_counts['B']:3d}  ← follow up today")
-    print(f"  C Cool (45-64)  : {grade_counts['C']:3d}  ← nurture sequence")
-    print(f"  D Cold (25-44)  : {grade_counts['D']:3d}  ← low priority")
-    print(f"  F Dead (0-24)   : {grade_counts['F']:3d}  ← skip")
+    print(f"  A Hot  (85-100) : {gc['A']:3d}  ← call immediately")
+    print(f"  B Warm (65-84)  : {gc['B']:3d}  ← follow up today")
+    print(f"  C Cool (45-64)  : {gc['C']:3d}  ← nurture sequence")
+    print(f"  D Cold (25-44)  : {gc['D']:3d}  ← low priority")
+    print(f"  F Dead (0-24)   : {gc['F']:3d}  ← skip")
     print(f"{'─'*50}")
 
 if __name__ == "__main__":
