@@ -87,21 +87,36 @@ def get_already_scored_ids(table_id):
         print(f"Could not query existing leads: {e}")
         return set()
 
+MAX_WINDOW_DAYS = 7  # Never scan more than 7 days back on any run
+
 def get_since_timestamp(table_id):
+    """Return the since-timestamp for this run, capped at MAX_WINDOW_DAYS ago."""
     get_bq()
+    now = datetime.now(timezone.utc)
+    hard_floor = now - timedelta(days=MAX_WINDOW_DAYS)
+
     try:
         rows = list(bq.query(f"SELECT MAX(lead_created_time) AS latest FROM `{table_id}`").result())
         latest = rows[0].latest if rows else None
         if latest:
+            # latest may be a naive datetime from BQ — ensure it's UTC-aware
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
             since = latest + timedelta(seconds=1)
-            since_str = since.strftime("%Y-%m-%dT%H:%M:%S+00:00")
-            print(f"Incremental: fetching leads after {since_str}")
-            return since_str
+            # Cap: never go further back than MAX_WINDOW_DAYS
+            if since < hard_floor:
+                print(f"Incremental: last record was {latest.date()} — capping window to {MAX_WINDOW_DAYS} days")
+                since = hard_floor
+            else:
+                print(f"Incremental: fetching leads after {since.strftime('%Y-%m-%dT%H:%M:%S+00:00')}")
+            return since.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     except Exception as e:
         print(f"Timestamp query failed: {e}")
-    since_str = f"{LEADS_START_DATE}T00:00:00+00:00"
-    print(f"Full backfill: fetching from {LEADS_START_DATE}")
-    return since_str
+
+    # No data in BQ yet — still cap at 7 days (don't do a full backfill on daily runs)
+    since = hard_floor
+    print(f"No prior data — starting from {MAX_WINDOW_DAYS}-day window: {since.date()}")
+    return since.strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 # ── Meta API ──────────────────────────────────────────────────────────────────
 def iso_to_unix(s):
@@ -142,15 +157,16 @@ def validate_token():
 
 def fetch_active_lead_ads():
     """
-    campaign -> ads route (no leadgen_forms, no leads_retrieval needed).
-    Only fetches ACTIVE/PAUSED ads from OUTCOME_LEADS campaigns.
+    Fetch ALL lead gen ads (active + inactive) so no leads within the 7-day
+    window are missed. campaign -> ads route (no leadgen_forms needed).
     """
     base = "https://graph.facebook.com/v19.0"
 
+    # Fetch ALL campaigns regardless of status — paused/archived campaigns still hold leads
     campaigns, err = meta_paginate(
         f"{base}/{META_AD_ACCOUNT_ID}/campaigns",
         {"access_token": META_ACCESS_TOKEN,
-         "fields": "id,name,objective,status",
+         "fields": "id,name,objective,status,effective_status",
          "limit": 100}
     )
     if err:
@@ -170,7 +186,7 @@ def fetch_active_lead_ads():
     all_ads = []
     for camp in lead_camps:
         time.sleep(0.3)
-        # Fetch ALL ads regardless of status — inactive campaigns still hold historical leads
+        # Fetch ALL ads (all statuses) — inactive ads still hold historical leads
         ads, err = meta_paginate(
             f"{base}/{camp['id']}/ads",
             {"access_token": META_ACCESS_TOKEN,
@@ -185,7 +201,9 @@ def fetch_active_lead_ads():
             ad["_campaign_name"] = camp["name"]
         all_ads.extend(ads)
 
-    print(f"  Total lead ads (all statuses): {len(all_ads)}")
+    active_count   = sum(1 for a in all_ads if a.get("effective_status") == "ACTIVE")
+    inactive_count = len(all_ads) - active_count
+    print(f"  Total lead ads: {len(all_ads)} ({active_count} active, {inactive_count} inactive/paused)")
     return all_ads
 
 def fetch_leads_from_ad(ad, since_ts, until_ts):
