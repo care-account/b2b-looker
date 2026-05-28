@@ -24,7 +24,7 @@ GROQ_API_KEY      = os.getenv("GROK_API_KEY") or os.getenv("GROQ_API_KEY")
 GROQ_URL          = "https://api.groq.com/openai/v1/chat/completions"
 
 MAX_WINDOW_DAYS   = 7    # Never look back more than 7 days
-META_FETCH_WORKERS = 20  # Parallel threads for fetching leads from ads
+META_FETCH_WORKERS = 5   # Keep under Meta rate limits  # Parallel threads for fetching leads from ads
 GROQ_WORKERS      = 8    # Parallel threads for Groq AI scoring
 GRAPH_VERSION     = "v19.0"
 BASE              = f"https://graph.facebook.com/{GRAPH_VERSION}"
@@ -130,32 +130,33 @@ def iso_to_unix(s):
     return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
 
 def meta_paginate_serial(url, params):
-    """Paginate a single Meta endpoint serially. Returns (results, error)."""
+    """Paginate a single Meta endpoint serially with exponential backoff."""
     results = []
     while url:
-        for attempt in range(4):
+        for attempt in range(6):  # waits: 30, 60, 120, 240, 300, 300s
             try:
                 r = requests.get(url, params=params if params else {}, timeout=30).json()
             except Exception as e:
-                if attempt < 3:
-                    time.sleep(5)
+                if attempt < 5:
+                    time.sleep(10)
                     continue
                 return results, str(e)
             if "error" in r:
                 msg  = r["error"]["message"]
                 code = r["error"].get("code", 0)
                 if code in (17, 80004) or "too many calls" in msg.lower():
-                    wait = 20 * (attempt + 1)
-                    print(f"  [RATE LIMIT] waiting {wait}s...")
+                    wait = min(300, 30 * (2 ** attempt))  # 30,60,120,240,300,300
+                    print(f"  [RATE LIMIT] waiting {wait}s (attempt {attempt+1}/6)...")
                     time.sleep(wait)
                     continue
                 return results, msg
             break
         else:
-            return results, "Rate limit exhausted"
+            return results, "Rate limit exhausted after 6 attempts"
         results.extend(r.get("data", []))
         url    = r.get("paging", {}).get("next")
         params = None
+        time.sleep(0.5)  # gentle inter-page pause
     return results, None
 
 def validate_token():
@@ -240,7 +241,8 @@ def fetch_leads_for_one_ad(ad, since_unix, until_dt, already_scored):
                 code = r["error"].get("code", 0)
                 msg  = r["error"]["message"]
                 if code in (17, 80004) or "too many calls" in msg.lower():
-                    time.sleep(15 * (attempt + 1))
+                    wait = min(120, 15 * (2 ** attempt))  # 15, 30, 60
+                    time.sleep(wait)
                     continue
                 # code 100 = no leads on this ad — expected, not an error
                 return leads
@@ -456,6 +458,7 @@ def main():
     # ── 1. Discover all lead-gen ads ─────────────────────────────────────────
     print("\nFetching lead gen ads...")
     t0  = time.time()
+    time.sleep(2)  # brief pause after token validation before campaign fetch
     ads = fetch_all_lead_ads()
     if not ads:
         print("No lead gen ads found.")
