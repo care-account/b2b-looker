@@ -88,20 +88,30 @@ def get_already_scored_ids(table_id):
         return set()
 
 def get_since_timestamp(table_id):
+    """
+    Returns (since_ts, is_incremental).
+    - Incremental: uses max(lead_created_time) from BigQuery, capped at 7 days back.
+    - Full backfill: uses LEADS_START_DATE (first run or empty table).
+    """
     get_bq()
+    seven_days_ago = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
     try:
         rows = list(bq.query(f"SELECT MAX(lead_created_time) AS latest FROM `{table_id}`").result())
         latest = rows[0].latest if rows else None
         if latest:
             since = latest + timedelta(seconds=1)
             since_str = since.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            # Cap at 7 days — don't re-scan months of old data on daily runs
+            if since_str < seven_days_ago:
+                print(f"Incremental (capped to 7 days): fetching leads after {seven_days_ago}")
+                return seven_days_ago, True
             print(f"Incremental: fetching leads after {since_str}")
-            return since_str
+            return since_str, True
     except Exception as e:
         print(f"Timestamp query failed: {e}")
     since_str = f"{LEADS_START_DATE}T00:00:00+00:00"
     print(f"Full backfill: fetching from {LEADS_START_DATE}")
-    return since_str
+    return since_str, False
 
 # ── Meta API ──────────────────────────────────────────────────────────────────
 def iso_to_unix(s):
@@ -140,10 +150,11 @@ def validate_token():
     print(f"[META] Token OK — {me.get('name', me.get('id'))}")
     return True
 
-def fetch_active_lead_ads():
+def fetch_active_lead_ads(active_only=False):
     """
     campaign -> ads route (no leadgen_forms, no leads_retrieval needed).
-    Only fetches ACTIVE/PAUSED ads from OUTCOME_LEADS campaigns.
+    active_only=True  → only ACTIVE/PAUSED ads (daily incremental — faster)
+    active_only=False → all ads including inactive (full historical backfill)
     """
     base = "https://graph.facebook.com/v19.0"
 
@@ -170,12 +181,19 @@ def fetch_active_lead_ads():
     all_ads = []
     for camp in lead_camps:
         time.sleep(0.3)
-        # Fetch ALL ads regardless of status — inactive campaigns still hold historical leads
+        # active_only=True for daily runs (inactive campaigns can't have NEW leads)
+        # active_only=False for full backfill (need historical inactive campaigns too)
+        ad_params = {
+            "access_token": META_ACCESS_TOKEN,
+            "fields": "id,name,effective_status",
+            "limit": 100
+        }
+        if active_only:
+            ad_params["filtering"] = '[{"field":"effective_status","operator":"IN","value":["ACTIVE","PAUSED"]}]'
+
         ads, err = meta_paginate(
             f"{base}/{camp['id']}/ads",
-            {"access_token": META_ACCESS_TOKEN,
-             "fields": "id,name,effective_status",
-             "limit": 100}
+            ad_params
         )
         if err:
             print(f"  Campaign '{camp['name']}' ads error: {err}")
@@ -185,7 +203,8 @@ def fetch_active_lead_ads():
             ad["_campaign_name"] = camp["name"]
         all_ads.extend(ads)
 
-    print(f"  Total lead ads (all statuses): {len(all_ads)}")
+    mode = "active/paused only" if active_only else "all statuses (backfill)"
+    print(f"  Total lead ads ({mode}): {len(all_ads)}")
     return all_ads
 
 def fetch_leads_from_ad(ad, since_ts, until_ts):
@@ -259,35 +278,156 @@ def parse_lead(lead):
     }
 
 # ── AI Scoring ────────────────────────────────────────────────────────────────
-INV_SCORE = {"yes, i'm ready to invest":40,"yes, i\u2019m ready to invest":40,
+
+# Rule-based point tables (used as structured input to AI, not final score)
+INV_SCORE = {"yes, i's ready to invest":40,"yes, i\u2019m ready to invest":40,
+             "yes, i'm ready to invest":40,
              "i may need financing options":20,"just exploring":5}
 TL_SCORE  = {"within 1\u20133 months":35,"within 3\u20136 months":20,"just exploring":5}
 ET_SCORE  = {"high_commission_per_successful_closure":25,"side_income":10,"just_exploring":2}
 
 def get_ai_score(lead):
+    # ── Step 1: Rule-based component scores ──────────────────────────────────
     inv_s = INV_SCORE.get(lead["investment_ready"].lower(), 5)
     tl_s  = TL_SCORE.get(lead["timeline"].lower(), 5)
     et_s  = ET_SCORE.get(lead["earning_intent"].lower(), 2)
-    base  = inv_s + tl_s + et_s
+    rule_total = inv_s + tl_s + et_s
 
-    inv_l = {40:"Ready to invest",20:"Needs financing",5:"Exploring"}.get(inv_s,"?")
-    tl_l  = {35:"1-3 months",20:"3-6 months",5:"Exploring"}.get(tl_s,"?")
-    et_l  = {25:"Franchise owner",10:"Side income",2:"Exploring"}.get(et_s,"?")
+    # ── Step 2: Data completeness signals ────────────────────────────────────
+    has_city     = bool(lead["city"] and lead["city"].strip() and lead["city"] != "?")
+    has_state    = bool(lead["state"] and lead["state"].strip())
+    has_phone    = bool(lead["phone"] and lead["phone"].strip())
+    has_email    = bool(lead["email"] and lead["email"].strip())
+    has_name     = bool(lead["lead_name"] and lead["lead_name"].strip())
+    completeness = sum([has_city, has_state, has_phone, has_email, has_name])
+    # 5 = fully complete, 0 = all blank
 
-    prompt = (
-        f"You are a B2B franchise analyst for FABO India. "
-        f"Score 0-100 likelihood this lead will open a FABO store.\n\n"
-        f"Name: {lead['lead_name'] or 'Unknown'}\n"
-        f"City: {lead['city'] or '?'}, {lead['state'] or '?'}\n"
-        f"Investment: \"{lead['investment_ready']}\" → {inv_l} [{inv_s}/40]\n"
-        f"Timeline: \"{lead['timeline']}\" → {tl_l} [{tl_s}/35]\n"
-        f"Intent: \"{lead['earning_intent']}\" → {et_l} [{et_s}/25]\n"
-        f"Rule baseline: {base}/100\n\n"
-        f"Guide: ready+1-3mo+franchise=85-100 | ready+longer=70-84 | "
-        f"financing+1-3mo=55-75 | financing+longer=40-60 | "
-        f"exploring=5-45 | missing fields=-10\n\n"
-        f"Return ONLY a single integer 0-100:\nScore:"
+    # ── Step 3: Platform signal ───────────────────────────────────────────────
+    platform = (lead["platform"] or "").lower()
+    platform_note = {
+        "ig": "Instagram — typically younger, higher engagement, impulse-driven",
+        "fb": "Facebook — typically older 30-55, more deliberate decision makers",
+    }.get(platform, "Platform unknown")
+
+    # ── Step 4: Campaign region context ──────────────────────────────────────
+    campaign = lead["campaign_name"] or ""
+    region_note = "Region unknown"
+    region_map = {
+        "assam":"Northeast India — emerging market, high volume but lower conversion",
+        "kerala":"Kerala — high literacy, cautious investors, but strong once committed",
+        "maharashtra":"Maharashtra — metro market, competitive, serious investors",
+        "bihar":"Bihar — price-sensitive market, high volume",
+        "mp":"Madhya Pradesh — tier 2/3 cities, value seekers",
+        "telangana":"Telangana/Hyderabad — strong B2B ecosystem",
+        "ap":"Andhra Pradesh — similar to Telangana",
+        "rajasthan":"Rajasthan — strong family business culture",
+        "gujarat":"Gujarat — strong entrepreneurial culture, serious investors",
+        "west bengal":"West Bengal — large market, moderate conversion",
+        "jharkhand":"Jharkhand — emerging market",
+        "ncr":"NCR/Delhi — metro, high intent but highly competitive",
+        "chandigarh":"Chandigarh/Punjab — high income, serious buyers",
+        "uttarakhand":"Uttarakhand — smaller market",
+        "chattisgarh":"Chhattisgarh — tier 2 market",
+        "odisha":"Odisha — emerging B2B market",
+        "punjab":"Punjab — strong business culture",
+    }
+    campaign_lower = campaign.lower()
+    for keyword, note in region_map.items():
+        if keyword in campaign_lower:
+            region_note = note
+            break
+
+    # ── Step 5: Build comprehensive prompt ────────────────────────────────────
+    inv_l = {40:"Ready to invest immediately",20:"Needs financing — interested but cautious",
+             5:"Just exploring — no commitment"}.get(inv_s, "Unknown")
+    tl_l  = {35:"Within 1–3 months — high urgency",20:"Within 3–6 months — moderate urgency",
+             5:"Just exploring — no timeline"}.get(tl_s, "Unknown")
+    et_l  = {25:"Wants franchise ownership / master franchise (strongest signal)",
+             10:"Wants side income (moderate signal — less committed)",
+             2:"Just exploring opportunities (weak signal)"}.get(et_s, "Unknown")
+
+    completeness_note = (
+        f"{completeness}/5 fields complete "
+        f"(city={'✓' if has_city else '✗'}, "
+        f"state={'✓' if has_state else '✗'}, "
+        f"phone={'✓' if has_phone else '✗'}, "
+        f"email={'✓' if has_email else '✗'}, "
+        f"name={'✓' if has_name else '✗'})"
     )
+
+    prompt = f"""You are an expert B2B franchise sales analyst for FABO, India's premium laundry franchise brand.
+
+Your task: Score 0–100 the probability this lead will actually open a FABO store or franchise.
+
+═══ LEAD PROFILE ═══
+Name      : {lead['lead_name'] or 'Unknown'}
+Location  : {lead['city'] or 'Unknown'}, {lead['state'] or 'Unknown'}
+Platform  : {platform.upper() or 'Unknown'} — {platform_note}
+Campaign  : {campaign or 'Unknown'}
+Region    : {region_note}
+Data completeness: {completeness_note}
+
+═══ FORM RESPONSES (what they told us) ═══
+Investment readiness : "{lead['investment_ready'] or '[blank]'}"
+  → {inv_l} | Rule score: {inv_s}/40
+
+Decision timeline    : "{lead['timeline'] or '[blank]'}"
+  → {tl_l} | Rule score: {tl_s}/35
+
+Earning opportunity  : "{lead['earning_intent'] or '[blank]'}"
+  → {et_l} | Rule score: {et_s}/25
+
+Rule-based total     : {rule_total}/100
+
+═══ SCORING FRAMEWORK ═══
+Apply ALL factors below and sum to arrive at final score:
+
+INVESTMENT READINESS (most important signal):
+  • "Ready to invest" + strong timeline + franchise intent = 85–100
+  • "Ready to invest" + weaker signals = 65–84
+  • "Needs financing" + strong timeline + franchise intent = 50–70
+  • "Needs financing" + weak signals = 30–50
+  • "Just exploring" regardless of other signals = 5–35
+
+TIMELINE URGENCY modifier:
+  • 1–3 months: +0 to +10 (already factored in rule score)
+  • 3–6 months: neutral
+  • Just exploring / blank: -10 to -15
+
+EARNING INTENT modifier:
+  • Franchise/commission: strongest signal, no deduction
+  • Side income: -5 to -10 (less committed, may drop off)
+  • Just exploring: -15 to -20
+
+REGION modifier (Indian B2B franchise context):
+  • Gujarat, Maharashtra, NCR, Punjab, Chandigarh: +3 to +5 (entrepreneurial culture)
+  • Kerala, Telangana, AP: +0 to +3 (educated, careful but committed once interested)
+  • Bihar, MP, Assam, West Bengal, Jharkhand: -3 to -5 (high volume but lower conversion rate)
+  • Unknown region: -5
+
+PLATFORM modifier:
+  • Facebook (30–55 age group, deliberate): +2
+  • Instagram (younger, impulse): -2 to 0
+  • Unknown: -3
+
+DATA COMPLETENESS modifier:
+  • 5/5 fields: +5
+  • 4/5 fields: +2
+  • 3/5 fields: 0
+  • 2/5 fields: -5
+  • 1/5 or 0/5 fields: -10 (lead may be fake or unusable)
+
+FINAL CALIBRATION:
+  • Score 90–100: Extremely rare. Only if all signals perfect AND complete data AND strong region
+  • Score 80–89: Strong lead, ready to act, good data
+  • Score 65–79: Warm lead, some friction but likely to convert
+  • Score 45–64: Needs nurturing, genuine interest but not ready
+  • Score 25–44: Low priority, may convert with right follow-up
+  • Score 0–24: Very unlikely to convert, skip or archive
+
+Return ONLY a single integer 0–100. No explanation. No text.
+Score:"""
+
     for attempt in range(3):
         try:
             r = requests.post(GROQ_URL,
@@ -300,13 +440,13 @@ def get_ai_score(lead):
             if r.status_code == 429:
                 time.sleep(4 * (attempt+1)); continue
             if not r.ok:
-                return base
-            raw = r.json()["choices"][0]["message"]["content"].strip()
-            m = re.search(r"\b(\d{1,3})\b", raw)
-            return max(0, min(100, int(m.group(1)))) if m else base
+                return rule_total
+            raw_resp = r.json()["choices"][0]["message"]["content"].strip()
+            m = re.search(r"\b(\d{1,3})\b", raw_resp)
+            return max(0, min(100, int(m.group(1)))) if m else rule_total
         except Exception:
-            return base
-    return base
+            return rule_total
+    return rule_total
 
 def grade(s):
     return "A" if s>=85 else "B" if s>=65 else "C" if s>=45 else "D" if s>=25 else "F"
@@ -325,14 +465,15 @@ def main():
     if not validate_token():
         return
 
-    since_ts = get_since_timestamp(table_id)
+    since_ts, is_incremental = get_since_timestamp(table_id)
     until_ts = now.strftime("%Y-%m-%dT%H:%M:%S+00:00")
     print(f"Window: {since_ts[:10]} → {until_ts[:10]}")
+    print(f"Mode: {'Incremental (active ads + 7-day cap)' if is_incremental else 'Full backfill (all ads)'}")
 
     already = get_already_scored_ids(table_id)
 
-    print("\nFetching active lead gen ads...")
-    ads = fetch_active_lead_ads()
+    print("\nFetching lead gen ads...")
+    ads = fetch_active_lead_ads(active_only=is_incremental)
     if not ads:
         print("No active lead gen ads found.")
         return
