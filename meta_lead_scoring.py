@@ -22,8 +22,8 @@ GROQ_URL          = "https://api.groq.com/openai/v1/chat/completions"
 # Date range control
 # Set LEADS_START_DATE + LEADS_END_DATE for an exact range (e.g. 2026-01-01 to 2026-01-31)
 # Leave both blank → auto last 7 days
-LEADS_START_DATE = os.getenv("LEADS_START_DATE", "2026-01-01")   # e.g. "2024-01-01"
-LEADS_END_DATE   = os.getenv("LEADS_END_DATE", "2026-01-31")     # e.g. "2026-05-31" (blank = now)
+LEADS_START_DATE = os.getenv("LEADS_START_DATE", "")   # e.g. "2024-01-01"
+LEADS_END_DATE   = os.getenv("LEADS_END_DATE", "")     # e.g. "2026-05-31" (blank = now)
 
 _raw = os.getenv("META_AD_ACCOUNT_ID", "")
 META_AD_ACCOUNT_ID = f"act_{_raw}" if _raw and not _raw.startswith("act_") else _raw
