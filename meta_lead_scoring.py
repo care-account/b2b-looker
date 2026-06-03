@@ -51,7 +51,7 @@ def setup_bigquery():
     schema = [
         bigquery.SchemaField("lead_id",           "STRING"),
         bigquery.SchemaField("lead_name",          "STRING"),
-        bigquery.SchemaField("phone",              "STRING"),
+        bigquery.SchemaField("phone",              "INTEGER"),
         bigquery.SchemaField("email",              "STRING"),
         bigquery.SchemaField("city",               "STRING"),
         bigquery.SchemaField("state",              "STRING"),
@@ -64,7 +64,7 @@ def setup_bigquery():
         bigquery.SchemaField("ad_name",            "STRING"),
         bigquery.SchemaField("form_name",          "STRING"),
         bigquery.SchemaField("lead_created_time",  "TIMESTAMP"),
-        bigquery.SchemaField("store_open_score",   "FLOAT"),
+        bigquery.SchemaField("store_open_score",   "INTEGER"),
         bigquery.SchemaField("grade",              "STRING"),
         bigquery.SchemaField("scored_at",          "TIMESTAMP"),
     ]
