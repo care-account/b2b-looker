@@ -2,7 +2,7 @@ name: Meta Lead Store Opener Scoring
 
 on:
   schedule:
-    - cron: '0 10 * * *'   # Daily 3:30 PM IST
+    - cron: '0 */4 * * *'  
   workflow_dispatch:
     inputs:
       start_date:
